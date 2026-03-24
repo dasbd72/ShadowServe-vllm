@@ -568,9 +568,11 @@ class precompiled_wheel_utils:
             print(f"Using user-specified precompiled wheel location: {wheel_location}")
             return wheel_location, None
         else:
-            # ROCm: use local wheel or AMD's PyPI index
+            # ROCm: use local wheel or AMD's PyPI index only when explicitly
+            # targeting ROCm. This avoids selecting ROCm wheels on mixed systems
+            # where ROCm is present but CUDA is the requested build target.
             # TODO: When we have ROCm nightly wheels, we can update this logic.
-            if precompiled_wheel_utils.is_rocm_system():
+            if VLLM_TARGET_DEVICE == "rocm":
                 return precompiled_wheel_utils.determine_wheel_url_rocm()
 
             import platform
