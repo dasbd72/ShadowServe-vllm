@@ -2696,6 +2696,177 @@ def cp_gather_indexer_k_quant_cache(
     )
 
 
+def gather_kv_blocks(
+    kv_cache: torch.Tensor,
+    src_block_table: list[int],
+    pinned_kv: torch.Tensor,
+    dst_block_table: list[int],
+    num_blocks: int,
+) -> None:
+    """Gather KV blocks from GPU (NHD) into pinned host memory for shadow CPU.
+
+    **V** (side 1) is transposed to HND per block. **K** (side 0) uses the packed
+    per-(block, head) layout expected by ``cpu_attn_reshape_and_cache`` /
+    ``cpu_attention_with_kv_cache`` (see ``csrc/shadow_kernels.cu``).
+
+    kv_cache:        GPU tensor [2, num_gpu_blocks, block_size, num_kv_heads, head_size]
+    src_block_table: length ``num_blocks`` — physical GPU block index per logical block
+    pinned_kv:       pinned CPU tensor [2, num_cpu_blocks, num_kv_heads, block_size, head_size]
+    dst_block_table: length ``num_blocks`` — physical CPU block index per logical block
+    num_blocks:      number of logical blocks to transfer
+    """
+    if num_blocks == 0:
+        return
+    if len(src_block_table) != num_blocks or len(dst_block_table) != num_blocks:
+        raise ValueError(
+            "src_block_table and dst_block_table must each have length num_blocks "
+            f"({num_blocks}), got {len(src_block_table)} and {len(dst_block_table)}"
+        )
+    src_bt = torch.tensor(src_block_table, dtype=torch.int32, device="cpu")
+    dst_bt = torch.tensor(dst_block_table, dtype=torch.int32, device="cpu")
+    torch.ops._C_shadow_ops.gather_kv_blocks(
+        kv_cache, src_bt, pinned_kv, dst_bt, num_blocks
+    )
+
+
+def gather_kv_blocks_batched(
+    kv_cache: torch.Tensor,
+    src_block_table_per_req: list[list[int]],
+    pinned_kv: torch.Tensor,
+    dst_block_table_per_req: list[list[int]],
+    num_blocks_per_req: torch.Tensor,
+) -> None:
+    """Gather KV blocks for multiple requests in a single kernel launch.
+
+    Each request contributes a pair of (src_block_table, dst_block_table) as Python lists.
+    They are concatenated into flat tensors and dispatched as one CUDA grid,
+    avoiding per-request kernel launch overhead.
+
+    kv_cache:                GPU tensor [2, N, block_size, num_kv_heads, head_size] (NHD)
+    src_block_table_per_req: one list of GPU block ids per request
+    pinned_kv:               pinned CPU tensor [2, M, num_kv_heads, block_size, head_size]
+                             (K packed for CPU attention, V HND)
+    dst_block_table_per_req: one list of CPU block ids per request
+    num_blocks_per_req:      int32 tensor [num_requests] — number of blocks per request
+    """
+    num_requests = len(src_block_table_per_req)
+    assert len(dst_block_table_per_req) == num_requests
+    assert len(num_blocks_per_req) == num_requests
+
+    if num_requests == 0:
+        return
+
+    total_num_blocks = int(num_blocks_per_req.sum().item())
+    src_block_table = torch.empty(total_num_blocks, dtype=torch.int32, device="cpu")
+    dst_block_table = torch.empty(total_num_blocks, dtype=torch.int32, device="cpu")
+
+    offset = 0
+    for i in range(num_requests):
+        n = int(num_blocks_per_req[i].item())
+        if len(src_block_table_per_req[i]) != n or len(dst_block_table_per_req[i]) != n:
+            raise ValueError(
+                "Per-request block tables must match num_blocks_per_req: "
+                f"request {i} expected length {n}, got "
+                f"{len(src_block_table_per_req[i])} and {len(dst_block_table_per_req[i])}"
+            )
+        src_block_table[offset : offset + n] = torch.as_tensor(
+            src_block_table_per_req[i], dtype=torch.int32
+        )
+        dst_block_table[offset : offset + n] = torch.as_tensor(
+            dst_block_table_per_req[i], dtype=torch.int32
+        )
+        offset += n
+
+    torch.ops._C_shadow_ops.gather_kv_blocks(
+        kv_cache, src_block_table, pinned_kv, dst_block_table, total_num_blocks
+    )
+
+
+def scatter_kv_blocks(
+    kv_cache: torch.Tensor,
+    src_block_table: list[int],
+    pinned_kv: torch.Tensor,
+    dst_block_table: list[int],
+    num_blocks: int,
+) -> None:
+    """Scatter KV blocks from pinned host memory into GPU KV cache (NHD).
+
+    This is the inverse of ``gather_kv_blocks``.
+
+    pinned_kv:       pinned CPU tensor [2, num_cpu_blocks, num_kv_heads, block_size, head_size]
+                    (K packed tile for CPU attention, V HND row-major)
+    src_block_table: length ``num_blocks`` — physical CPU block index per logical block
+    kv_cache:        GPU tensor [2, num_gpu_blocks, block_size, num_kv_heads, head_size] (NHD)
+    dst_block_table: length ``num_blocks`` — physical GPU block index per logical block
+    num_blocks:      number of logical blocks to transfer
+    """
+    if num_blocks == 0:
+        return
+    if len(src_block_table) != num_blocks or len(dst_block_table) != num_blocks:
+        raise ValueError(
+            "src_block_table and dst_block_table must each have length num_blocks "
+            f"({num_blocks}), got {len(src_block_table)} and {len(dst_block_table)}"
+        )
+    src_bt = torch.tensor(src_block_table, dtype=torch.int32, device="cpu")
+    dst_bt = torch.tensor(dst_block_table, dtype=torch.int32, device="cpu")
+    torch.ops._C_shadow_ops.scatter_kv_blocks(
+        kv_cache, src_bt, pinned_kv, dst_bt, num_blocks
+    )
+
+
+def scatter_kv_blocks_batched(
+    kv_cache: torch.Tensor,
+    src_block_table_per_req: list[list[int]],
+    pinned_kv: torch.Tensor,
+    dst_block_table_per_req: list[list[int]],
+    num_blocks_per_req: torch.Tensor,
+) -> None:
+    """Scatter KV blocks for multiple requests in a single kernel launch.
+
+    This is the inverse of ``gather_kv_blocks_batched`` and mirrors its data
+    preparation: per-request block lists are concatenated into flat int32 tensors
+    and dispatched as a single CUDA grid.
+
+    kv_cache:                GPU tensor [2, N, block_size, num_kv_heads, head_size] (NHD)
+    src_block_table_per_req: one list of pinned-CPU block ids per request
+    pinned_kv:               pinned CPU tensor [2, M, num_kv_heads, block_size, head_size]
+                             (K packed for CPU attention, V HND)
+    dst_block_table_per_req: one list of GPU block ids per request
+    num_blocks_per_req:      int32 tensor [num_requests] — number of blocks per request
+    """
+    num_requests = len(src_block_table_per_req)
+    assert len(dst_block_table_per_req) == num_requests
+    assert len(num_blocks_per_req) == num_requests
+
+    if num_requests == 0:
+        return
+
+    total_num_blocks = int(num_blocks_per_req.sum().item())
+    src_block_table = torch.empty(total_num_blocks, dtype=torch.int32, device="cpu")
+    dst_block_table = torch.empty(total_num_blocks, dtype=torch.int32, device="cpu")
+
+    offset = 0
+    for i in range(num_requests):
+        n = int(num_blocks_per_req[i].item())
+        if len(src_block_table_per_req[i]) != n or len(dst_block_table_per_req[i]) != n:
+            raise ValueError(
+                "Per-request block tables must match num_blocks_per_req: "
+                f"request {i} expected length {n}, got "
+                f"{len(src_block_table_per_req[i])} and {len(dst_block_table_per_req[i])}"
+            )
+        src_block_table[offset : offset + n] = torch.as_tensor(
+            src_block_table_per_req[i], dtype=torch.int32
+        )
+        dst_block_table[offset : offset + n] = torch.as_tensor(
+            dst_block_table_per_req[i], dtype=torch.int32
+        )
+        offset += n
+
+    torch.ops._C_shadow_ops.scatter_kv_blocks(
+        kv_cache, src_block_table, pinned_kv, dst_block_table, total_num_blocks
+    )
+
+
 def get_device_attribute(attribute: int, device: int) -> int:
     return torch.ops._C_cuda_utils.get_device_attribute(attribute, device)
 
