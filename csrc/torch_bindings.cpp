@@ -1,3 +1,4 @@
+#include "shadow.h"
 #include "cache.h"
 #include "cuda_utils.h"
 #include "ops.h"
@@ -807,6 +808,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "dst_scale, Tensor block_table, Tensor cu_seq_lens) -> ()");
   cache_ops.impl("cp_gather_indexer_k_quant_cache", torch::kCUDA,
                  &cp_gather_indexer_k_quant_cache);
+}
+
+TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _shadow_ops), shadow_ops) {
+  shadow_ops.def(
+      "gather_kv_blocks(Tensor kv_cache, Tensor src_block_table,"
+      "                 Tensor! pinned_kv, Tensor dst_block_table,"
+      "                 int num_blocks) -> ()");
+  shadow_ops.impl("gather_kv_blocks", torch::kCUDA,
+                  &vllm::shadow::gather_kv_blocks);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
