@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, dataclass, fields, is_dataclass
@@ -54,6 +55,7 @@ from vllm.config import (
     PrefetchOffloadConfig,
     ProfilerConfig,
     SchedulerConfig,
+    ShadowMigrationConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
     UVAOffloadConfig,
@@ -89,7 +91,7 @@ from vllm.config.parallel import (
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import SchedulerPolicy
-from vllm.config.utils import get_field
+from vllm.config.utils import get_field, replace
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
@@ -608,6 +610,16 @@ class EngineArgs:
     weight_transfer_config: WeightTransferConfig | None = get_field(
         VllmConfig,
         "weight_transfer_config",
+    )
+
+    enable_shadow_migration: bool = get_field(
+        ShadowMigrationConfig, "enable_shadow_migration"
+    )
+    shadow_additional_blocks_per_request: int = get_field(
+        ShadowMigrationConfig, "shadow_additional_blocks_per_request"
+    )
+    shadow_tkcth_ipc_prefix: str | None = get_field(
+        ShadowMigrationConfig, "shadow_tkcth_ipc_prefix"
     )
 
     fail_on_environ_validation: bool = False
@@ -1279,6 +1291,24 @@ class EngineArgs:
             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
         )
 
+        shadow_kwargs = get_kwargs(ShadowMigrationConfig)
+        shadow_group = parser.add_argument_group(
+            title="ShadowMigrationConfig",
+            description=ShadowMigrationConfig.__doc__,
+        )
+        shadow_group.add_argument(
+            "--enable-shadow-migration",
+            **shadow_kwargs["enable_shadow_migration"],
+        )
+        shadow_group.add_argument(
+            "--shadow-additional-blocks-per-request",
+            **shadow_kwargs["shadow_additional_blocks_per_request"],
+        )
+        shadow_group.add_argument(
+            "--shadow-tkcth-ipc-prefix",
+            **shadow_kwargs["shadow_tkcth_ipc_prefix"],
+        )
+
         # Other arguments
         parser.add_argument(
             "--disable-log-stats",
@@ -1887,6 +1917,46 @@ class EngineArgs:
             ),
         )
 
+        if self.shadow_additional_blocks_per_request < 0:
+            raise ValueError("shadow_additional_blocks_per_request must be >= 0")
+
+        shadow_migration_config = ShadowMigrationConfig(
+            enable_shadow_migration=self.enable_shadow_migration,
+            shadow_additional_blocks_per_request=self.shadow_additional_blocks_per_request,
+            shadow_tkcth_ipc_prefix=self.shadow_tkcth_ipc_prefix,
+        )
+        if "VLLM_ENABLE_SHADOW_MIGRATION" in os.environ:
+            shadow_migration_config = replace(
+                shadow_migration_config,
+                enable_shadow_migration=envs.VLLM_ENABLE_SHADOW_MIGRATION,
+            )
+        if "VLLM_SHADOW_ADDITIONAL_BLOCKS_PER_REQUEST" in os.environ:
+            shadow_migration_config = replace(
+                shadow_migration_config,
+                shadow_additional_blocks_per_request=int(
+                    os.environ["VLLM_SHADOW_ADDITIONAL_BLOCKS_PER_REQUEST"]
+                ),
+            )
+        if "VLLM_SHADOW_TKCTH_IPC_PREFIX" in os.environ:
+            raw = os.environ["VLLM_SHADOW_TKCTH_IPC_PREFIX"].strip()
+            shadow_migration_config = replace(
+                shadow_migration_config,
+                shadow_tkcth_ipc_prefix=raw or None,
+            )
+        if shadow_migration_config.shadow_additional_blocks_per_request < 0:
+            raise ValueError(
+                "shadow_additional_blocks_per_request must be >= 0 "
+                "(check --shadow-additional-blocks-per-request / env)"
+            )
+        if shadow_migration_config.enable_shadow_migration:
+            tk_pfx = shadow_migration_config.shadow_tkcth_ipc_prefix
+            if tk_pfx is None or not str(tk_pfx).strip():
+                raise ValueError(
+                    "enable_shadow_migration requires a non-empty "
+                    "shadow_tkcth_ipc_prefix "
+                    "(--shadow-tkcth-ipc-prefix / VLLM_SHADOW_TKCTH_IPC_PREFIX)"
+                )
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1910,6 +1980,7 @@ class EngineArgs:
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
+            shadow_migration_config=shadow_migration_config,
         )
 
         return config

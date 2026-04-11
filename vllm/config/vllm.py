@@ -41,6 +41,7 @@ from .offload import OffloadConfig
 from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .scheduler import SchedulerConfig
+from .shadow_migration import ShadowMigrationConfig
 from .speculative import EagleModelTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
@@ -302,6 +303,10 @@ class VllmConfig:
     """The configurations for event publishing."""
     ec_transfer_config: ECTransferConfig | None = None
     """The configurations for distributed EC cache transfer."""
+    shadow_migration_config: ShadowMigrationConfig = Field(
+        default_factory=ShadowMigrationConfig
+    )
+    """Serverless shadow KV migration (hot GPU → cold shadow CPU)."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
