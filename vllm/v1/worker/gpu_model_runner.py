@@ -3069,7 +3069,17 @@ class GPUModelRunner(
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
-                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
+                # Shadow migration needs real output token ids for handoff.
+                # In async scheduling, the default behavior appends a -1 placeholder
+                # that may only be repaired later (penalties/logitsprocs path).
+                # When shadow migration is enabled, sync a single sampled token id
+                # to CPU to keep `output_token_ids` accurate.
+                if req_idx in invalid_req_indices_set:
+                    sampled_ids = None
+                elif self.vllm_config.shadow_migration_config.enable_shadow_migration:
+                    sampled_ids = [int(sampled_token_ids[req_idx, 0].item())]
+                else:
+                    sampled_ids = [-1]
             else:
                 sampled_ids = valid_sampled_token_ids[req_idx]
 

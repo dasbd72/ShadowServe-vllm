@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 import queue
+import secrets
 import signal
 import threading
 import time
@@ -25,6 +26,11 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.shadow.transfer.tkcth_protocol import (
+    TkcthError,
+    TkcthFinish,
+    TkcthTokenDelta,
+)
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -57,6 +63,11 @@ from vllm.v1.engine import (
     ReconfigureRankType,
     UtilityOutput,
     UtilityResult,
+)
+from vllm.v1.engine.shadow_tkcth_session import (
+    ShadowSessionDone,
+    ShadowTkcthSession,
+    shadow_finish_to_engine_and_status,
 )
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -217,6 +228,8 @@ class EngineCore:
 
         self.aborts_queue = queue.Queue[list[str]]()
 
+        self._shadow_tkcth_sessions: list[ShadowTkcthSession] = []
+
         self._idle_state_callbacks: list[Callable] = []
 
         # Mark the startup heap as static so that it's ignored by GC.
@@ -329,6 +342,193 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    def run_shadow_migration_to_kvhtc_ipc(
+        self,
+        kvhtc_ipc_path: str,
+        migration_id: int | None = None,
+        request_ids: list[str] | None = None,
+    ) -> list[str]:
+        """Detach scheduled requests; gather KV; send via KVHTC transport; free blocks.
+
+        Returns the request ids migrated.
+
+        If the worker RPC fails after detach, requests are aborted to release
+        scheduler/KV state.
+        """
+        if not self.vllm_config.shadow_migration_config.enable_shadow_migration:
+            raise RuntimeError(
+                "kvhtc migration is disabled "
+                "(enable_shadow_migration / --enable-shadow-migration)"
+            )
+        if request_ids is None:
+            return []
+        mid = migration_id if migration_id is not None else time.time_ns()
+        smc = self.vllm_config.shadow_migration_config
+        tk_pfx = smc.shadow_tkcth_ipc_prefix
+        if tk_pfx is None or not str(tk_pfx).strip():
+            raise RuntimeError(
+                "shadow migration requires shadow_tkcth_ipc_prefix "
+                "(--shadow-tkcth-ipc-prefix / VLLM_SHADOW_TKCTH_IPC_PREFIX)"
+            )
+        tkcth_ipc_path = f"{str(tk_pfx).strip()}-{secrets.token_hex(8)}"
+
+        detached = self.scheduler.detach_requests_for_shadow_migration(request_ids)
+        if not detached:
+            logger.warning("kvhtc migration: no requests to detach")
+            return []
+
+        migrate_request_ids = [r.request_id for r in detached]
+        migrate_client_indices = [r.client_index for r in detached]
+        request_id_to_client_index = {
+            rid: int(c) for rid, c in zip(migrate_request_ids, migrate_client_indices)
+        }
+
+        recv_ready = threading.Event()
+        session = ShadowTkcthSession(
+            tkcth_ipc_path=tkcth_ipc_path,
+            migration_id=int(mid),
+            request_ids=list(migrate_request_ids),
+            request_id_to_client_index=request_id_to_client_index,
+            recv_ready_event=recv_ready,
+        )
+
+        try:
+            self.collective_rpc(
+                "execute_shadow_kv_migration",
+                args=(
+                    kvhtc_ipc_path,
+                    mid,
+                    migrate_request_ids,
+                    migrate_client_indices,
+                    tkcth_ipc_path,
+                ),
+            )
+        except Exception:
+            session.cancel()
+            session.join()
+            self.scheduler.finish_requests(
+                migrate_request_ids, RequestStatus.FINISHED_ABORTED
+            )
+            raise
+
+        self.scheduler.promote_migrated_requests_to_shadow_running(migrate_request_ids)
+        recv_ready.set()
+
+        self._shadow_tkcth_sessions.append(session)
+        return migrate_request_ids
+
+    def get_shadow_migration_requests(
+        self, include_finished: bool = True, finished_limit: int = 1024
+    ) -> dict[str, Any]:
+        return self.scheduler.get_shadow_migration_request_infos(
+            include_finished=include_finished, finished_limit=finished_limit
+        )
+
+    def _drain_shadow_events(self) -> list[tuple[int, EngineCoreOutputs]]:
+        """Drain events from all active TKCTH sessions.
+
+        Called from the main engine loop.  All scheduler mutations happen
+        here (single-threaded), not in the recv threads.
+
+        Returns a list of ``(client_index, EngineCoreOutputs)`` ready to
+        be enqueued to the output path.
+        """
+        if not self._shadow_tkcth_sessions:
+            return []
+
+        results: list[tuple[int, EngineCoreOutputs]] = []
+
+        for session in self._shadow_tkcth_sessions:
+            for event in session.drain_events():
+                if isinstance(event, TkcthTokenDelta):
+                    rid = event.request_id
+                    cidx = session.request_id_to_client_index[rid]
+                    results.append(
+                        (
+                            cidx,
+                            EngineCoreOutputs(
+                                outputs=[
+                                    EngineCoreOutput(
+                                        request_id=rid,
+                                        new_token_ids=list(event.token_ids),
+                                    )
+                                ]
+                            ),
+                        )
+                    )
+
+                elif isinstance(event, TkcthFinish):
+                    rid = event.request_id
+                    cidx = session.request_id_to_client_index[rid]
+                    eng_fr, st = shadow_finish_to_engine_and_status(event.finish_reason)
+                    self.scheduler.finish_requests([rid], st)
+                    results.append(
+                        (
+                            cidx,
+                            EngineCoreOutputs(
+                                outputs=[
+                                    EngineCoreOutput(
+                                        request_id=rid,
+                                        new_token_ids=[],
+                                        finish_reason=eng_fr,
+                                    )
+                                ]
+                            ),
+                        )
+                    )
+
+                elif isinstance(event, TkcthError):
+                    rids = (
+                        [event.request_id]
+                        if event.request_id is not None
+                        else list(session.request_id_to_client_index)
+                    )
+                    for rid in rids:
+                        cidx = session.request_id_to_client_index[rid]
+                        self.scheduler.finish_requests(
+                            [rid], RequestStatus.FINISHED_ERROR
+                        )
+                        results.append(
+                            (
+                                cidx,
+                                EngineCoreOutputs(
+                                    outputs=[
+                                        EngineCoreOutput(
+                                            request_id=rid,
+                                            new_token_ids=[],
+                                            finish_reason=FinishReason.ERROR,
+                                        )
+                                    ]
+                                ),
+                            )
+                        )
+
+                elif isinstance(event, ShadowSessionDone):
+                    for rid in event.orphaned_request_ids:
+                        cidx = session.request_id_to_client_index[rid]
+                        self.scheduler.finish_requests(
+                            [rid], RequestStatus.FINISHED_ERROR
+                        )
+                        results.append(
+                            (
+                                cidx,
+                                EngineCoreOutputs(
+                                    outputs=[
+                                        EngineCoreOutput(
+                                            request_id=rid,
+                                            new_token_ids=[],
+                                            finish_reason=FinishReason.ERROR,
+                                        )
+                                    ]
+                                ),
+                            )
+                        )
+
+        self._shadow_tkcth_sessions = [
+            s for s in self._shadow_tkcth_sessions if not s.is_done
+        ]
+        return results
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -545,6 +745,10 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
+        for session in self._shadow_tkcth_sessions:
+            session.cancel()
+            session.join(timeout=2.0)
+        self._shadow_tkcth_sessions.clear()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1115,6 +1319,7 @@ class EngineCoreProc(EngineCore):
             self.engines_running
             or self.scheduler.has_requests()
             or bool(self.batch_queue)
+            or bool(self._shadow_tkcth_sessions)
         )
 
     def run_busy_loop(self):
@@ -1169,11 +1374,16 @@ class EngineCoreProc(EngineCore):
         # Post-step hook.
         self.post_step(model_executed)
 
+        # Drain shadow TKCTH events (single-threaded scheduler access).
+        for shadow_output in self._drain_shadow_events():
+            self.output_queue.put_nowait(shadow_output)
+
         # If no model execution happened but there are waiting requests
-        # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
-        # background threads (like NIXL handshake) to make progress.
-        # Without this, the tight polling loop can starve background threads.
-        if not model_executed and self.scheduler.has_unfinished_requests():
+        # or active shadow sessions, yield the GIL briefly to allow
+        # background threads to make progress.
+        if not model_executed and (
+            self.scheduler.has_unfinished_requests() or self._shadow_tkcth_sessions
+        ):
             time.sleep(0.001)
 
         return model_executed
@@ -1239,11 +1449,13 @@ class EngineCoreProc(EngineCore):
         arg_types = signature(method).parameters.values()
         assert len(args) <= len(arg_types)
         return tuple(
-            msgspec.convert(v, type=p.annotation)
-            if isclass(p.annotation)
-            and issubclass(p.annotation, msgspec.Struct)
-            and not isinstance(v, p.annotation)
-            else v
+            (
+                msgspec.convert(v, type=p.annotation)
+                if isclass(p.annotation)
+                and issubclass(p.annotation, msgspec.Struct)
+                and not isinstance(v, p.annotation)
+                else v
+            )
             for v, p in zip(args, arg_types)
         )
 

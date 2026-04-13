@@ -216,6 +216,21 @@ class EngineClient(ABC):
         """Perform a collective RPC call to the given path."""
         raise NotImplementedError
 
+    async def run_shadow_migration_to_kvhtc_ipc(
+        self,
+        kvhtc_ipc_path: str,
+        migration_id: int | None = None,
+        request_ids: list[str] | None = None,
+    ) -> list[str]:
+        """Run hot-side shadow KV migration to the given KVHTC IPC endpoint."""
+        raise NotImplementedError
+
+    async def get_shadow_migration_requests(
+        self, *, include_finished: bool = True, finished_limit: int = 1024
+    ) -> dict[str, Any]:
+        """List requests for shadow migration orchestration."""
+        raise NotImplementedError
+
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks"""
         raise NotImplementedError

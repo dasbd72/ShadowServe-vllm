@@ -814,6 +814,27 @@ class Worker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1, uniform_decode=True)
 
+    def execute_shadow_kv_migration(
+        self,
+        kvhtc_ipc_path: str,
+        migration_id: int,
+        request_ids: list[str],
+        client_indices: list[int],
+        tkcth_ipc_path: str,
+    ) -> None:
+        from vllm.v1.worker.shadow_kv_migration import (
+            execute_shadow_kv_migration_for_model_runner,
+        )
+
+        execute_shadow_kv_migration_for_model_runner(
+            self.model_runner,
+            kvhtc_ipc_path,
+            migration_id,
+            request_ids,
+            client_indices,
+            tkcth_ipc_path,
+        )
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 
