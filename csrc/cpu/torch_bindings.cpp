@@ -4,9 +4,20 @@
 
 #include <torch/library.h>
 
-// Note: overwrite the external defination for sharing same name between
-// libraries use different ISAs.
-#define TORCH_EXTENSION_NAME _C
+// `TORCH_EXTENSION_NAME` is set by the build to the Python extension / PyInit
+// basename (`_C`, `_C_AVX2`, `_cpu_C`, ...).
+//
+// `VLLM_CPU_TORCH_OPS_LIBRARY_NAME` is the Torch custom-op *library* slice
+// (``torch.ops.<name>``): standalone CPU builds use `_C` (merge with the
+// usual vLLM layout); GPU auxiliary CPU shards use `_cpu_ops` so they do not
+// collide with CUDA/HIP ``torch.ops._C`` when both extensions load.
+#ifndef TORCH_EXTENSION_NAME
+  #error "TORCH_EXTENSION_NAME must be defined by the build."
+#endif
+#ifndef VLLM_CPU_TORCH_OPS_LIBRARY_NAME
+  #error \
+      "VLLM_CPU_TORCH_OPS_LIBRARY_NAME must be set by CMake (cpu_extension.cmake)."
+#endif
 
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
@@ -126,7 +137,7 @@ void cpu_fused_moe(torch::Tensor& output, const torch::Tensor& input,
                    const torch::Tensor& topk_id, const bool skip_weighted,
                    const std::string& act, const std::string& isa);
 
-TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+TORCH_LIBRARY_EXPAND(VLLM_CPU_TORCH_OPS_LIBRARY_NAME, ops) {
   // vLLM custom ops
 
   ops.def(
