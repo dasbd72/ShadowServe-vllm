@@ -22,6 +22,10 @@ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
+option(VLLM_BUILD_CPU_EXT_AS_GPU_AUX
+  "Also build csrc/cpu into vllm._cpu_C (+ _cpu_C_AVX2 on x86_64); ops register as torch.ops._cpu_ops"
+  OFF)
+
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
 # Suppress potential warnings about unused manually-specified variables
@@ -1164,6 +1168,11 @@ define_extension_target(
   INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
   USE_SABI 3
   WITH_SOABI)
+
+if(VLLM_BUILD_CPU_EXT_AS_GPU_AUX AND (VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP"))
+  message(STATUS "Building auxiliary CPU ops (csrc/cpu) as vllm._cpu_C / torch.ops._cpu_ops alongside ${VLLM_GPU_LANG}.")
+  include(${CMAKE_CURRENT_LIST_DIR}/cmake/cpu_extension.cmake)
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "HIP")
   #
