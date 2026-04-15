@@ -1,0 +1,2647 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index ac6494ae9..b861e7659 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -814,6 +814,13 @@ COPY examples/online_serving/sagemaker-entrypoint.sh .
+ RUN chmod +x sagemaker-entrypoint.sh
+ ENTRYPOINT ["./sagemaker-entrypoint.sh"]
+ 
++FROM vllm-openai-base AS vllm-openai-shadow
++
++COPY docker/vllm-shadow-entrypoint.sh /usr/local/bin/vllm-shadow-entrypoint
++RUN chmod +x /usr/local/bin/vllm-shadow-entrypoint
++
++ENTRYPOINT ["/usr/local/bin/vllm-shadow-entrypoint"]
++
+ FROM vllm-openai-base AS vllm-openai
+ 
+ ENTRYPOINT ["vllm", "serve"]
+diff --git a/docker/vllm-shadow-entrypoint.sh b/docker/vllm-shadow-entrypoint.sh
+new file mode 100755
+index 000000000..34b0c0f1d
+--- /dev/null
++++ b/docker/vllm-shadow-entrypoint.sh
+@@ -0,0 +1,120 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
++# Container entrypoint for the vllm-openai image.
++#
++# Without --enable-shadow-migration-cold this behaves identically to the previous
++#   ENTRYPOINT ["vllm", "serve"]
++#
++# With --enable-shadow-migration-cold the entrypoint additionally launches a shadow
++# CPU process (`python -m vllm.shadow.cli.main`) in the background before
++# starting the main GPU server.  The shadow process is intended for
++# serverless cold-start acceleration (Phase 1 skeleton).
++#
++# Resource-isolation knobs (best-effort, optional):
++#   VLLM_SHADOW_CPUSET  – CPU affinity mask for the shadow process
++#                          (e.g. "0-3").  Requires `taskset`.
++#   VLLM_MAIN_CPUSET    – CPU affinity mask for the main vllm serve
++#                          process.  Requires `taskset`.
++#
++# IPC knobs forwarded to the shadow process:
++#   VLLM_SHADOW_KVHTC_IPC_PREFIX – UDS path prefix; shadow appends `-` + random hex.
++
++set -euo pipefail
++
++SHADOW_PID=""
++ENABLE_SHADOW_MIGRATION_COLD=0
++SHADOW_KVHTC_IPC_PREFIX=""
++
++# ── Parse and strip cold-only flags from argv ──────────────────────
++ARGS=()
++for arg in "$@"; do
++    case "$arg" in
++        --enable-shadow-migration-cold)
++            ENABLE_SHADOW_MIGRATION_COLD=1
++            ;;
++        --shadow-kvhtc-ipc-prefix)
++            # handled below (expects value in next token)
++            ARGS+=("$arg")
++            ;;
++        *)
++            ARGS+=("$arg")
++            ;;
++    esac
++done
++
++# Re-scan args to capture --shadow-kvhtc-ipc-prefix value and remove the pair from ARGS.
++MAIN_ARGS=()
++i=0
++while [[ $i -lt ${#ARGS[@]} ]]; do
++    if [[ "${ARGS[$i]}" == "--shadow-kvhtc-ipc-prefix" ]]; then
++        if [[ $((i + 1)) -ge ${#ARGS[@]} ]]; then
++            echo "[entrypoint] ERROR: --shadow-kvhtc-ipc-prefix requires a value" >&2
++            exit 2
++        fi
++        SHADOW_KVHTC_IPC_PREFIX="${ARGS[$((i + 1))]}"
++        i=$((i + 2))
++        continue
++    fi
++    MAIN_ARGS+=("${ARGS[$i]}")
++    i=$((i + 1))
++done
++
++# ── Signal handling ────────────────────────────────────────────────
++cleanup() {
++    if [[ -n "$SHADOW_PID" ]] && kill -0 "$SHADOW_PID" 2>/dev/null; then
++        echo "[entrypoint] Forwarding signal to shadow CPU process (PID $SHADOW_PID)..."
++        kill -TERM "$SHADOW_PID" 2>/dev/null || true
++        wait "$SHADOW_PID" 2>/dev/null || true
++        echo "[entrypoint] Shadow CPU process exited."
++    fi
++}
++trap cleanup EXIT SIGTERM SIGINT
++
++# ── Optionally start shadow CPU process ────────────────────────────
++if [[ "$ENABLE_SHADOW_MIGRATION_COLD" -eq 1 ]]; then
++    SHADOW_CMD=(python3 -m vllm.shadow.cli.main)
++
++    # Forward IPC config to shadow process via CLI args
++    if [[ -n "${SHADOW_KVHTC_IPC_PREFIX:-}" ]]; then
++        SHADOW_CMD+=(--shadow-kvhtc-ipc-prefix "$SHADOW_KVHTC_IPC_PREFIX")
++    elif [[ -n "${VLLM_SHADOW_KVHTC_IPC_PREFIX:-}" ]]; then
++        SHADOW_CMD+=(--shadow-kvhtc-ipc-prefix "$VLLM_SHADOW_KVHTC_IPC_PREFIX")
++    fi
++
++    # Mirror model/math flags from ``vllm serve`` so the shadow CPU process loads the same HF config.
++    i=0
++    while [[ $i -lt ${#MAIN_ARGS[@]} ]]; do
++        case "${MAIN_ARGS[$i]}" in
++            --model|--dtype|--max-model-len|--block-size)
++                if [[ $((i + 1)) -lt ${#MAIN_ARGS[@]} ]]; then
++                    SHADOW_CMD+=("${MAIN_ARGS[$i]}" "${MAIN_ARGS[$((i + 1))]}")
++                    i=$((i + 2))
++                    continue
++                fi
++                ;;
++        esac
++        i=$((i + 1))
++    done
++
++    # Best-effort CPU affinity for shadow process
++    if [[ -n "${VLLM_SHADOW_CPUSET:-}" ]] && command -v taskset &>/dev/null; then
++        SHADOW_CMD=(taskset -c "$VLLM_SHADOW_CPUSET" "${SHADOW_CMD[@]}")
++    fi
++
++    echo "[entrypoint] Starting shadow CPU process: ${SHADOW_CMD[*]}"
++    VLLM_TARGET_DEVICE=cpu "${SHADOW_CMD[@]}" &
++    SHADOW_PID=$!
++    echo "[entrypoint] Shadow CPU process started (PID $SHADOW_PID)."
++fi
++
++# ── Launch main GPU server ─────────────────────────────────────────
++MAIN_CMD=(vllm serve "${MAIN_ARGS[@]}")
++
++if [[ -n "${VLLM_MAIN_CPUSET:-}" ]] && command -v taskset &>/dev/null; then
++    MAIN_CMD=(taskset -c "$VLLM_MAIN_CPUSET" "${MAIN_CMD[@]}")
++fi
++
++echo "[entrypoint] Starting main GPU server: ${MAIN_CMD[*]}"
++exec "${MAIN_CMD[@]}"
+diff --git a/docs/assets/contributing/dockerfile-stages-dependency.png b/docs/assets/contributing/dockerfile-stages-dependency.png
+index 9ac394d4c..4f496db72 100644
+Binary files a/docs/assets/contributing/dockerfile-stages-dependency.png and b/docs/assets/contributing/dockerfile-stages-dependency.png differ
+diff --git a/vllm/shadow/cli/__init__.py b/vllm/shadow/cli/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/vllm/shadow/cli/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/shadow/cli/main.py b/vllm/shadow/cli/main.py
+new file mode 100644
+index 000000000..58b125777
+--- /dev/null
++++ b/vllm/shadow/cli/main.py
+@@ -0,0 +1,124 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Shadow process for accelerated serverless cold-start in vLLM.
++
++This script is executed when the `--enable-shadow-migration-cold` flag is set.
++It is designed to run concurrently with the main GPU-driven `vllm-serve`, handling
++CPU-based decoding to bridge the latency gap while the main process initializes
++(model loading, compilation, CUDA graph capture, and warmup).
++
++Lifecycle:
++
++- Parse CLI and construct ``ShadowEngine`` (loads CPU weights; can take a long time).
++- Start the engine thread: bind a unique KVHTC UDS at
++  ``{--shadow-kvhtc-ipc-prefix}-{16_hex}``, then write ``--ready-file`` with two lines:
++  process PID, then the full socket path (see ``ShadowEngine._emit_ready``).
++- Block in ``join()`` until migration+decode finishes or SIGTERM/SIGINT.
++"""
++
++import argparse
++import logging
++import os
++import signal
++import tempfile
++
++from vllm.shadow.config.config import ShadowConfig
++from vllm.shadow.engine.engine import ShadowEngine
++
++logger = logging.getLogger("vllm.shadow.cli.main")
++
++# ── CLI ────────────────────────────────────────────────────────────
++
++
++def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="vLLM shadow CPU process (serverless cold-start)",
++    )
++    parser.add_argument(
++        "--shadow-kvhtc-ipc-prefix",
++        dest="shadow_kvhtc_ipc_prefix",
++        required=True,
++        help="Path prefix for the shadow KVHTC Unix socket; `-` plus 16 hex chars "
++        "are appended at startup (one unique socket per shadow process). "
++        "Example: /tmp/vllm-shadow-kvhtc → /tmp/vllm-shadow-kvhtc-a1b2c3d4e5f67890. "
++        "Required.",
++    )
++    parser.add_argument(
++        "--ready-file",
++        default=os.path.join(tempfile.gettempdir(), "vllm_shadow_ready"),
++        help=(
++            "Path written after KVHTC listen is ready: line 1 = PID, line 2 = full "
++            "KVHTC socket path (same format as tests and docker smoke expect)."
++        ),
++    )
++    parser.add_argument(
++        "--log-level",
++        default="INFO",
++        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
++        help="Logging verbosity.",
++    )
++    parser.add_argument(
++        "--model",
++        default="Qwen/Qwen3-0.6B",
++        help="Same model id/path as ``vllm serve`` (loads HF config + safetensors).",
++    )
++    parser.add_argument(
++        "--dtype",
++        default="auto",
++        help="Weight/KV dtype alignment with the GPU server (e.g. bfloat16).",
++    )
++    parser.add_argument(
++        "--max-model-len",
++        type=int,
++        default=-1,
++        help="Mirrors ``--max-model-len`` on the GPU process. Use -1 for auto.",
++    )
++    parser.add_argument(
++        "--block-size",
++        type=int,
++        default=16,
++        help="KV block size; must match the hot pod ``--block-size``.",
++    )
++    return parser.parse_args(argv)
++
++
++def _shadow_config_from_args(args: argparse.Namespace) -> ShadowConfig:
++    model = str(args.model)
++    return ShadowConfig(
++        model=model,
++        dtype=str(args.dtype),
++        max_model_len=int(args.max_model_len),
++        block_size=int(args.block_size),
++    )
++
++
++def main(argv: list[str] | None = None) -> None:
++    args = parse_args(argv)
++
++    logging.basicConfig(
++        level=getattr(logging, args.log_level),
++        format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
++    )
++
++    logger.info("Shadow CPU engine starting (PID %d)...", os.getpid())
++    shadow_cfg = _shadow_config_from_args(args)
++    shadow_engine = ShadowEngine(
++        ready_file=args.ready_file,
++        shadow_kvhtc_ipc_prefix=args.shadow_kvhtc_ipc_prefix,
++        shadow_config=shadow_cfg,
++    )
++
++    def _handle_signal(signum: int, _frame: object) -> None:
++        sig_name = signal.Signals(signum).name
++        logger.info("Received %s — initiating shutdown.", sig_name)
++        shadow_engine.stop(reason=f"signal={sig_name}")
++
++    signal.signal(signal.SIGTERM, _handle_signal)
++    signal.signal(signal.SIGINT, _handle_signal)
++
++    shadow_engine.start()
++    shadow_engine.join()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm/shadow/config/__init__.py b/vllm/shadow/config/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/vllm/shadow/config/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/shadow/config/config.py b/vllm/shadow/config/config.py
+new file mode 100644
+index 000000000..d6496120d
+--- /dev/null
++++ b/vllm/shadow/config/config.py
+@@ -0,0 +1,30 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Shadow process config aligned with :class:`vllm.engine.arg_utils.EngineArgs`."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Literal, TypeAlias
++
++import torch
++
++from vllm.shadow.transfer.kvhtc_protocol import torch_dtype_from_str
++
++ModelDType: TypeAlias = Literal["auto", "float16", "bfloat16"]
++
++
++@dataclass(slots=True)
++class ShadowConfig:
++    """Subset of serve-time settings mirrored into the shadow CPU process."""
++
++    model: str = "Qwen/Qwen3-0.6B"
++    dtype: ModelDType | torch.dtype = "auto"
++    max_model_len: int | None = None
++    block_size: int = 16
++
++    def __post_init__(self) -> None:
++        if self.dtype == "auto":
++            self.dtype = torch.float16
++        elif isinstance(self.dtype, str):
++            self.dtype = torch_dtype_from_str(self.dtype)
+diff --git a/vllm/shadow/config/hf_config.py b/vllm/shadow/config/hf_config.py
+new file mode 100644
+index 000000000..0316dceab
+--- /dev/null
++++ b/vllm/shadow/config/hf_config.py
+@@ -0,0 +1,213 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Read ``config.json`` from a local HF checkpoint (no ``transformers`` import)."""
++
++from __future__ import annotations
++
++import json
++import os
++from dataclasses import dataclass
++from typing import Any
++
++
++def _model_type(raw: dict[str, Any]) -> str:
++    return str(raw.get("model_type", "")).lower()
++
++
++def _default_rope_theta_for_model(raw: dict[str, Any]) -> float:
++    mt = _model_type(raw)
++    if mt == "qwen3":
++        return 1_000_000.0
++    return 10_000.0
++
++
++def _extract_initial_rope_dict(raw: dict[str, Any]) -> dict[str, Any]:
++    """Flatten HF ``rope_parameters`` / legacy ``rope_scaling`` to a single dict."""
++    rp = raw.get("rope_parameters")
++    if isinstance(rp, dict) and rp:
++        out = dict(rp)
++        if list(out.keys()) == ["default"] and isinstance(out["default"], dict):
++            return dict(out["default"])
++        return out
++    rs = raw.get("rope_scaling")
++    if isinstance(rs, dict) and rs:
++        return dict(rs)
++    return {}
++
++
++def normalize_shadow_rope_parameters(
++    raw: dict[str, Any], *, max_position_embeddings: int
++) -> dict[str, Any]:
++    """Normalize HF RoPE fields.
++
++    Shadow CPU supports only ``rope_type`` ``default`` and ``llama3``.
++    """
++    rp = _extract_initial_rope_dict(raw)
++    for key in (
++        "rope_theta",
++        "partial_rotary_factor",
++        "original_max_position_embeddings",
++    ):
++        if key in raw and key not in rp:
++            rp[key] = raw[key]
++
++    if "rope_type" not in rp and "type" in rp:
++        rp["rope_type"] = rp["type"]
++
++    # Nested per-layer ``rope_parameters`` (e.g. Gemma3):
++    # only dict values, no rope_type.
++    if (
++        rp
++        and "rope_type" not in rp
++        and "type" not in rp
++        and all(isinstance(v, dict) for v in rp.values())
++    ):
++        raise NotImplementedError(
++            "shadow RoPE: nested rope_parameters by attention layer type are not "
++            "supported (text-only shadow stack)"
++        )
++
++    if "rope_theta" not in rp:
++        rp["rope_theta"] = _default_rope_theta_for_model(raw)
++
++    rp.setdefault("rope_type", "default")
++    rp.setdefault("partial_rotary_factor", 1.0)
++
++    rope_type = str(rp["rope_type"])
++    if rope_type not in ("default", "llama3"):
++        raise NotImplementedError(
++            "shadow RoPE: only rope_type 'default' and 'llama3' are supported; "
++            f"got {rope_type!r}"
++        )
++
++    if rope_type == "default" and "mrope_section" in rp:
++        raise NotImplementedError(
++            "shadow RoPE: mrope_section (mRoPE) is not supported on the CPU path"
++        )
++
++    if rope_type == "default" and rp.get("use_fope"):
++        raise NotImplementedError(
++            "shadow RoPE: Fourier RoPE (use_fope) is not supported on the CPU path"
++        )
++
++    if rope_type == "llama3":
++        rp.setdefault(
++            "original_max_position_embeddings",
++            raw.get("original_max_position_embeddings", max_position_embeddings),
++        )
++
++    return rp
++
++
++@dataclass(slots=True)
++class ShadowHfConfig:
++    """Fields needed for Llama / Qwen2 / Qwen3–style CPU decode."""
++
++    model_type: str
++    hidden_size: int
++    num_hidden_layers: int
++    num_attention_heads: int
++    num_key_value_heads: int
++    intermediate_size: int
++    rms_norm_eps: float
++    vocab_size: int
++    max_position_embeddings: int
++    rope_theta: float
++    partial_rotary_factor: float
++    rotary_dim: int
++    sliding_window: int | None
++    head_dim: int
++    eos_token_id: int | None
++    architectures: list[str]
++    # Normalized RoPE dict (``rope_type``, ``rope_theta``, scaling fields)
++    rope_parameters: dict[str, Any]
++
++
++def load_shadow_hf_config(model_dir: str) -> ShadowHfConfig:
++    path = os.path.join(model_dir, "config.json")
++    if not os.path.isfile(path):
++        raise FileNotFoundError(f"missing config.json in {model_dir}")
++    with open(path) as f:
++        raw: dict = json.load(f)
++
++    model_type = str(raw.get("model_type", "llama"))
++    hidden_size = int(raw["hidden_size"])
++    num_hidden_layers = int(raw["num_hidden_layers"])
++    num_attention_heads = int(raw["num_attention_heads"])
++    num_key_value_heads = int(raw.get("num_key_value_heads", num_attention_heads))
++    intermediate_size = int(raw["intermediate_size"])
++    rms_norm_eps = float(raw.get("rms_norm_eps", 1e-6))
++    vocab_size = int(raw["vocab_size"])
++    max_position_embeddings = int(raw.get("max_position_embeddings", 8192))
++    rope_parameters = normalize_shadow_rope_parameters(
++        raw, max_position_embeddings=max_position_embeddings
++    )
++    rope_theta = float(rope_parameters["rope_theta"])
++    partial_rotary_factor = float(rope_parameters["partial_rotary_factor"])
++    if not (0.0 < partial_rotary_factor <= 1.0):
++        raise ValueError(
++            f"partial_rotary_factor must be in (0, 1], got {partial_rotary_factor}"
++        )
++    sw = raw.get("sliding_window")
++    sliding_window = None if sw is None else int(sw)
++
++    if "head_dim" in raw:
++        head_dim = int(raw["head_dim"])
++        if head_dim <= 0:
++            raise ValueError(f"head_dim must be positive, got {head_dim}")
++        q_heads_total = head_dim * num_attention_heads
++        kv_heads_total = head_dim * num_key_value_heads
++        # Llama / Qwen2: ``num_attention_heads * head_dim == hidden_size``.
++        # Qwen3 can set a larger per-head size so Q is wider than ``hidden_size`` while
++        # K/V still map ``hidden_size -> num_key_value_heads * head_dim``
++        # (often == hidden).
++        if q_heads_total != hidden_size and kv_heads_total != hidden_size:
++            raise ValueError(
++                "explicit head_dim is inconsistent with hidden_size: expected "
++                "head_dim * num_attention_heads == hidden_size or "
++                "head_dim * num_key_value_heads == hidden_size "
++                f"(got {q_heads_total=}, {kv_heads_total=}, {hidden_size=})"
++            )
++    else:
++        head_dim = hidden_size // num_attention_heads
++        if head_dim * num_attention_heads != hidden_size:
++            raise ValueError("hidden_size must be divisible by num_attention_heads")
++
++    rotary_dim = int(head_dim * partial_rotary_factor)
++    if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
++        raise ValueError(
++            f"invalid rotary_dim={rotary_dim} (head_dim={head_dim}, "
++            f"partial_rotary_factor={partial_rotary_factor})"
++        )
++
++    eos = raw.get("eos_token_id")
++    eos_token_id: int | None
++    if eos is None:
++        eos_token_id = None
++    elif isinstance(eos, list):
++        eos_token_id = int(eos[0]) if eos else None
++    else:
++        eos_token_id = int(eos)
++
++    arch_raw = raw.get("architectures")
++    architectures = [str(x) for x in arch_raw] if isinstance(arch_raw, list) else []
++
++    return ShadowHfConfig(
++        model_type=model_type,
++        hidden_size=hidden_size,
++        num_hidden_layers=num_hidden_layers,
++        num_attention_heads=num_attention_heads,
++        num_key_value_heads=num_key_value_heads,
++        intermediate_size=intermediate_size,
++        rms_norm_eps=rms_norm_eps,
++        vocab_size=vocab_size,
++        max_position_embeddings=max_position_embeddings,
++        rope_theta=rope_theta,
++        partial_rotary_factor=partial_rotary_factor,
++        rotary_dim=rotary_dim,
++        sliding_window=sliding_window,
++        head_dim=head_dim,
++        eos_token_id=eos_token_id,
++        architectures=architectures,
++        rope_parameters=dict(rope_parameters),
++    )
+diff --git a/vllm/shadow/engine/__init__.py b/vllm/shadow/engine/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/vllm/shadow/engine/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/shadow/engine/engine.py b/vllm/shadow/engine/engine.py
+new file mode 100644
+index 000000000..fc76b662d
+--- /dev/null
++++ b/vllm/shadow/engine/engine.py
+@@ -0,0 +1,291 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Shadow CPU engine: KVHTC receive loop and shadow worker (decode + TKCTH)."""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import secrets
++import threading
++import time
++from contextlib import suppress
++
++from transformers import AutoTokenizer
++
++from vllm.shadow.config.config import ShadowConfig
++from vllm.shadow.executor.executor import ShadowExecutor
++from vllm.shadow.models.model_runner import ShadowModelRunner
++from vllm.shadow.transfer.kvhtc_memfd import (
++    MemfdTensor,
++    UdsMemfdKvHtcReceiverTransport,
++)
++from vllm.shadow.transfer.kvhtc_protocol import HandoffRequest, MigrationHandoff
++
++logger = logging.getLogger("vllm.shadow.engine.engine")
++
++_ACCEPT_POLL_S = 1.0
++_ACCEPT_BACKLOG = 128
++
++
++__all__ = ("ShadowEngine",)
++
++
++class ShadowEngine:
++    """Shadow CPU process with KVHTC migration receive loop.
++
++    Model weights are loaded eagerly at startup so they are ready before the
++    first migration arrives. The engine thread runs one accept → receive →
++    decode session, then signals shutdown so the process can exit.
++    """
++
++    def __init__(
++        self,
++        ready_file: str,
++        shadow_kvhtc_ipc_prefix: str,
++        shadow_config: ShadowConfig,
++    ) -> None:
++        self._ready_file: str = ready_file
++        self._shadow_kvhtc_ipc_path: str = (
++            f"{shadow_kvhtc_ipc_prefix}-{secrets.token_hex(8)}"
++        )
++        self._shadow_config: ShadowConfig = shadow_config
++
++        self._kvhtc_receiver: UdsMemfdKvHtcReceiverTransport | None = None
++        self._executor: ShadowExecutor | None = None
++
++        t0 = time.perf_counter()
++        self._runner = ShadowModelRunner.load_from_config(self._shadow_config)
++        logger.info(
++            "Shadow CPU weights ready (load_wall_ms=%.1f).",
++            (time.perf_counter() - t0) * 1000.0,
++        )
++
++        self._engine_thread: threading.Thread | None = None
++        self._engine_error: BaseException | None = None
++        self._stop_event = threading.Event()
++
++        self._tokenizer = AutoTokenizer.from_pretrained(
++            self._shadow_config.model,
++            trust_remote_code=True,
++        )
++
++    # ── Lifecycle ─────────────────────────────────────────────────────
++
++    def start(self) -> None:
++        """Start the shadow engine in a background thread."""
++        if self._engine_thread is not None:
++            raise RuntimeError("ShadowEngine.start() already called")
++        self._engine_error = None
++        self._stop_event.clear()
++        self._engine_thread = threading.Thread(
++            target=self._run_engine,
++            name="shadow-cpu-engine",
++            daemon=False,
++        )
++        self._engine_thread.start()
++
++        logger.info(
++            "Shadow CPU process running (PID %d). Waiting for shutdown signal...",
++            os.getpid(),
++        )
++
++    def stop(self, *, reason: str | None = None) -> None:
++        """Request shutdown and release blocking resources.
++
++        This method is safe to call multiple times.
++        """
++        if reason:
++            logger.info("Shadow CPU engine stopping: %s", reason)
++        else:
++            logger.info("Shadow CPU engine stopping.")
++        self._stop_event.set()
++        # Ensure accept() unblocks promptly.
++        self._close_kvhtc_receiver()
++        if self._executor is not None:
++            self._executor.stop()
++
++    def join(self, timeout: float | None = None) -> None:
++        """Wait for engine shutdown and re-raise any background exception."""
++        if self._engine_thread is None:
++            raise RuntimeError("ShadowEngine.start() was not called")
++        self._engine_thread.join(timeout=timeout)
++        if timeout is not None and self._engine_thread.is_alive():
++            raise TimeoutError("shadow engine did not finish within timeout")
++        err = self._engine_error
++        if err is not None:
++            raise err
++
++    # ── Engine ──────────────────────────────────────────────────────
++
++    def _run_engine(self) -> None:
++        try:
++            self._initialize()
++            self._accept_once_loop()
++            if self._stop_requested():
++                return
++            self._receive_and_decode()
++        except BaseException as e:
++            self._engine_error = e
++        finally:
++            self._teardown()
++
++    def _initialize(self) -> None:
++        device = os.environ.get("VLLM_TARGET_DEVICE", "")
++        if device and device != "cpu":
++            logger.warning(
++                "VLLM_TARGET_DEVICE is '%s', expected 'cpu'. "
++                "The shadow process is designed for CPU-only operation.",
++                device,
++            )
++
++        self._prepare_kvhtc_receiver()
++        self._emit_ready()
++
++    def _teardown(self) -> None:
++        self._close_kvhtc_receiver()
++        if os.path.exists(self._ready_file):
++            with suppress(OSError):
++                os.unlink(self._ready_file)
++        ipc = self._shadow_kvhtc_ipc_path
++        if ipc and os.path.exists(ipc):
++            with suppress(OSError):
++                os.unlink(ipc)
++
++    def _prepare_kvhtc_receiver(self) -> None:
++        transport = UdsMemfdKvHtcReceiverTransport()
++        transport.prepare(
++            self._shadow_kvhtc_ipc_path,
++            backlog=_ACCEPT_BACKLOG,
++            accept_timeout=_ACCEPT_POLL_S,
++        )
++        self._kvhtc_receiver = transport
++        logger.info(
++            "Listening for kvhtc migration on IPC %s.",
++            self._shadow_kvhtc_ipc_path,
++        )
++
++    def _close_kvhtc_receiver(self) -> None:
++        if self._kvhtc_receiver is not None:
++            with suppress(OSError):
++                self._kvhtc_receiver.close()
++            self._kvhtc_receiver = None
++
++    def _emit_ready(self) -> None:
++        """Write a ready-file so the entrypoint (or tests) can detect startup.
++
++        Format: line 1 = PID, line 2 = KVHTC IPC socket path (no trailing newline).
++        """
++        try:
++            with open(self._ready_file, "w") as f:
++                f.write(str(os.getpid()))
++                f.write("\n")
++                f.write(self._shadow_kvhtc_ipc_path)
++            logger.info("Ready signal written to %s", self._ready_file)
++        except OSError:
++            logger.warning(
++                "Could not write ready-file %s", self._ready_file, exc_info=True
++            )
++
++    # ── Migration session (engine thread: accept → receive → decode) ──
++
++    def _stop_requested(self) -> bool:
++        return self._stop_event.is_set()
++
++    def _accept_once_loop(self) -> None:
++        """Wait for one KVHTC connection, run migration + decode, then exit."""
++        assert self._kvhtc_receiver is not None
++        receiver = self._kvhtc_receiver
++
++        while not self._stop_requested():
++            try:
++                receiver.accept_once()
++                break
++            except TimeoutError:
++                continue
++            except OSError:
++                if self._stop_requested():
++                    return
++                logger.warning("accept failed", exc_info=True)
++                continue
++
++        if self._stop_requested():
++            return
++
++    def _receive_and_decode(self) -> None:
++        assert self._kvhtc_receiver is not None
++        receiver = self._kvhtc_receiver
++
++        handoff = receiver.recv_handoff()
++        logger.info(
++            "Received migration handoff: migration_id=%s num_layers=%s batch_size=%s",
++            handoff.migration_id,
++            handoff.num_layers,
++            handoff.batch_size,
++        )
++        for req in handoff.requests:
++            self._log_received_request(req)
++
++        layer_tensors = self._recv_all_layers(receiver, handoff)
++        self._executor = ShadowExecutor(
++            handoff, runner=self._runner, layer_kv_tensors=layer_tensors
++        )
++        try:
++            self._executor.start()
++            self._executor.join()
++        finally:
++            self._executor = None
++
++    def _log_received_request(self, req: HandoffRequest) -> None:
++        logger.info(
++            "Request: request_id=%s client_index=%s "
++            "num_computed_tokens=%s num_prompt_tokens=%s "
++            "sampling_params=%s",
++            req.request_id,
++            req.client_index,
++            req.num_computed_tokens,
++            req.num_prompt_tokens,
++            json.dumps(req.sampling_params),
++        )
++        logger.info(
++            "Request: request_id=%s prompt_token_ids=%r | output_token_ids=%r",
++            req.request_id,
++            req.prompt_token_ids,
++            req.output_token_ids,
++        )
++        tok = self._tokenizer
++        if req.prompt_token_ids:
++            prompt_text = tok.decode(req.prompt_token_ids, skip_special_tokens=True)
++        else:
++            prompt_text = "<no prompt_token_ids>"
++        if req.output_token_ids:
++            output_text = tok.decode(req.output_token_ids, skip_special_tokens=True)
++        else:
++            output_text = "<no output tokens yet>"
++        logger.info(
++            "Request: request_id=%s prompt=%r | output=%r",
++            req.request_id,
++            prompt_text,
++            output_text,
++        )
++
++    @staticmethod
++    def _recv_all_layers(
++        receiver: UdsMemfdKvHtcReceiverTransport,
++        handoff: MigrationHandoff,
++    ) -> list[MemfdTensor]:
++        out: list[MemfdTensor] = []
++        for layer_idx in range(handoff.num_layers):
++            envelope, tensor = receiver.recv_layer(handoff)
++            if layer_idx != envelope.layer_idx:
++                raise ValueError(
++                    f"layer index mismatch: {layer_idx} != {envelope.layer_idx}"
++                )
++            out.append(tensor)
++            logger.info(
++                "Received layer %d: migration_id=%s",
++                layer_idx,
++                handoff.migration_id,
++            )
++        return out
+diff --git a/vllm/shadow/executor/__init__.py b/vllm/shadow/executor/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/vllm/shadow/executor/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/shadow/executor/executor.py b/vllm/shadow/executor/executor.py
+new file mode 100644
+index 000000000..8defb1d21
+--- /dev/null
++++ b/vllm/shadow/executor/executor.py
+@@ -0,0 +1,269 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU shadow executor: autoregressive decode + TKCTH.
++
++Decode: for each output token, run layers 0..L-1 in order; after layer L-1,
++sample the next token and advance to the next step.
++
++Weights are loaded eagerly by :class:`~vllm.shadow.engine.engine.ShadowEngine`
++before the first migration arrives.
++
++KV is expected to be fully received before constructing this executor and must
++be passed via ``layer_kv_tensors``. This executor does not support registering
++KV incrementally.
++
++Call :meth:`start` to begin the decode thread, then :meth:`join`.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import time
++from contextlib import suppress
++
++from vllm.shadow.executor.kv_manager import ShadowKvManager
++from vllm.shadow.models.model_runner import ShadowModelRunner
++from vllm.shadow.models.paged_kv import ShadowCpuPagedKvAccessor
++from vllm.shadow.models.sampling import (
++    ShadowSamplingParams,
++    sampling_params_from_wire_dict,
++)
++from vllm.shadow.transfer.kvhtc_memfd import MemfdTensor
++from vllm.shadow.transfer.kvhtc_protocol import HandoffRequest, MigrationHandoff
++from vllm.shadow.transfer.tkcth_protocol import TkcthFinish, TkcthTokenDelta
++from vllm.shadow.transfer.tkcth_uds import UdsTkcthSenderTransport
++
++logger = logging.getLogger("vllm.shadow.executor.executor")
++
++_DEFAULT_MAX_TOKENS_WHEN_MISSING = 16
++
++_DECODE_JOIN_TIMEOUT_S = 300.0
++
++__all__ = ("ShadowExecutor",)
++
++
++def _max_decode_budget(hr: HandoffRequest) -> int:
++    raw = hr.sampling_params.get("max_tokens")
++    if raw is None:
++        return _DEFAULT_MAX_TOKENS_WHEN_MISSING
++    return max(0, int(raw))
++
++
++def _remaining_new_tokens(hr: HandoffRequest, output_tail: list[int]) -> int:
++    return max(0, _max_decode_budget(hr) - len(output_tail))
++
++
++class ShadowExecutor:
++    """CPU-side shadow executor: decode thread + KV from caller.
++
++    The ``runner`` must already have weights loaded (see
++    :meth:`ShadowModelRunner.load_from_dir`).
++    """
++
++    def __init__(
++        self,
++        handoff: MigrationHandoff,
++        runner: ShadowModelRunner,
++        layer_kv_tensors: list[MemfdTensor],
++    ) -> None:
++        self._handoff = handoff
++        n = handoff.num_layers
++        if n <= 0:
++            raise ValueError("num_layers must be positive")
++        if not handoff.requests:
++            raise ValueError("migration handoff has no requests")
++        self._num_layers = n
++        self._kv_manager = ShadowKvManager(handoff)
++        self._output_tails: list[list[int]] = [
++            list(r.output_token_ids) for r in handoff.requests
++        ]
++        self._runner = runner
++
++        self._sampling_params: list[ShadowSamplingParams] = [
++            sampling_params_from_wire_dict(r.sampling_params) for r in handoff.requests
++        ]
++
++        self._all_token_ids: list[list[int]] = []
++        for r in handoff.requests:
++            ids: list[int] = []
++            if r.prompt_token_ids is not None:
++                ids.extend(r.prompt_token_ids)
++            ids.extend(r.output_token_ids)
++            self._all_token_ids.append(ids)
++
++        logger.info(
++            "ShadowExecutor migration_id=%s num_layers=%s batch_size=%s",
++            handoff.migration_id,
++            n,
++            handoff.batch_size,
++        )
++
++        self._tkcth_sender: UdsTkcthSenderTransport | None = None
++
++        self._executor_thread: threading.Thread | None = None
++        self._executor_error: BaseException | None = None
++        self._stop_event = threading.Event()
++
++        if len(layer_kv_tensors) != self._num_layers:
++            raise ValueError(
++                f"expected {self._num_layers} layer KV tensors, got "
++                f"{len(layer_kv_tensors)}"
++            )
++        for layer_idx, t in enumerate(layer_kv_tensors):
++            self._kv_manager.register_layer(layer_idx, t)
++
++    # ── Lifecycle ─────────────────────────────────────────────────────
++
++    def start(self) -> None:
++        """Start the decode thread."""
++        if self._executor_thread is not None:
++            raise RuntimeError("ShadowExecutor.start() already called")
++        self._executor_error = None
++        self._stop_event.clear()
++        self._executor_thread = threading.Thread(
++            target=self._run_executor,
++            name="shadow-cpu-decode",
++            daemon=False,
++        )
++        self._executor_thread.start()
++
++    def stop(self) -> None:
++        self._stop_event.set()
++
++    def join(self, timeout: float | None = None) -> None:
++        if self._executor_thread is None:
++            raise RuntimeError("ShadowExecutor.start() was not called")
++        self._executor_thread.join(timeout=timeout)
++        if timeout is not None and self._executor_thread.is_alive():
++            raise TimeoutError("decode thread did not finish within timeout")
++        err = self._executor_error
++        if err is not None:
++            raise err
++
++    # ── Executor ───────────────────────────────────────────────────────
++
++    def _run_executor(self) -> None:
++        try:
++            self._initialize()
++            self._decode_loop()
++            if self._stop_requested():
++                return
++            self._emit_finishes()
++        except BaseException as e:
++            self._executor_error = e
++        finally:
++            self._teardown()
++
++    def _initialize(self) -> None:
++        transport = UdsTkcthSenderTransport()
++        transport.connect(self._handoff.tkcth_ipc_path)
++        self._tkcth_sender = transport
++
++    def _teardown(self) -> None:
++        if self._tkcth_sender is not None:
++            with suppress(OSError):
++                self._tkcth_sender.close()
++            self._tkcth_sender = None
++
++    def _max_decode_token_steps(self) -> int:
++        m = 0
++        for hr in self._handoff.requests:
++            m = max(m, _max_decode_budget(hr))
++        return max(1, m)
++
++    def _stop_requested(self) -> bool:
++        return self._stop_event.is_set()
++
++    def _decode_loop(self) -> None:
++        if self._stop_requested():
++            return
++        kv_accessor = ShadowCpuPagedKvAccessor(self._kv_manager)
++        step_idx = 0
++        nreq = len(self._handoff.requests)
++        active = [True] * nreq
++        max_steps = self._max_decode_token_steps()
++
++        for _ in range(max_steps):
++            if self._stop_requested():
++                return
++
++            # Collect the batch of active requests for this step
++            batch_ri: list[int] = []
++            batch_token_ids: list[int] = []
++            batch_sp: list[ShadowSamplingParams] = []
++            for ri in range(nreq):
++                if not active[ri]:
++                    continue
++                hr = self._handoff.requests[ri]
++                if _remaining_new_tokens(hr, self._output_tails[ri]) <= 0:
++                    active[ri] = False
++                    continue
++                self._kv_manager.prepare_decode_step(ri)
++                past_len = self._kv_manager.num_computed[ri]
++                batch_ri.append(ri)
++                batch_token_ids.append(self._all_token_ids[ri][past_len])
++                batch_sp.append(self._sampling_params[ri])
++
++            if not batch_ri:
++                break
++
++            t0 = time.perf_counter()
++            results = self._runner.generate_step(
++                batch_ri,
++                batch_sp,
++                batch_token_ids,
++                self._kv_manager,
++                kv_accessor,
++            )
++            dt_ms = (time.perf_counter() - t0) * 1000.0
++
++            logger.info(
++                "shadow_cpu_decode migration_id=%s output_token_ids=%s "
++                "step=%s batch_size=%d wall_ms=%.2f",
++                self._handoff.migration_id,
++                [r[0] for r in results],
++                step_idx,
++                len(batch_ri),
++                dt_ms,
++            )
++
++            for idx, ri in enumerate(batch_ri):
++                tid, stopped = results[idx]
++                hr = self._handoff.requests[ri]
++                self._output_tails[ri].append(tid)
++                self._all_token_ids[ri].append(tid)
++                self._emit_single_token_delta(hr.request_id, tid)
++                self._kv_manager.advance_num_computed(ri)
++                if stopped:
++                    active[ri] = False
++
++            step_idx += 1
++
++    # ---- TKCTH emission ----
++
++    def _emit_single_token_delta(
++        self,
++        request_id: str,
++        token_id: int,
++    ) -> None:
++        assert self._tkcth_sender is not None
++        self._tkcth_sender.send(
++            TkcthTokenDelta(
++                migration_id=int(self._handoff.migration_id),
++                request_id=request_id,
++                token_ids=[token_id],
++            )
++        )
++
++    def _emit_finishes(self) -> None:
++        assert self._tkcth_sender is not None
++        mid = int(self._handoff.migration_id)
++        for hr in self._handoff.requests:
++            self._tkcth_sender.send(
++                TkcthFinish(
++                    migration_id=mid,
++                    request_id=hr.request_id,
++                    finish_reason="stop",
++                )
++            )
+diff --git a/vllm/shadow/executor/kv_manager.py b/vllm/shadow/executor/kv_manager.py
+new file mode 100644
+index 000000000..2c1fa900d
+--- /dev/null
++++ b/vllm/shadow/executor/kv_manager.py
+@@ -0,0 +1,181 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paged KV state for the shadow CPU executor (no engine/scheduler imports)."""
++
++from __future__ import annotations
++
++import logging
++from typing import Final
++
++from vllm.shadow.transfer.kvhtc_memfd import MemfdTensor
++from vllm.shadow.transfer.kvhtc_protocol import (
++    MigrationHandoff,
++    torch_dtype_from_str,
++)
++
++logger = logging.getLogger("vllm.shadow.executor.shadow_kv_manager")
++
++__all__ = ("ShadowKvManager",)
++
++
++def _required_blocks(num_computed_tokens: int, block_size: int) -> int:
++    if block_size <= 0:
++        raise ValueError("block_size must be positive")
++    if num_computed_tokens <= 0:
++        return 0
++    return (num_computed_tokens + block_size - 1) // block_size
++
++
++class ShadowKvManager:
++    """Validates migration handoff, holds per-layer memfd KV tensors, and tracks
++    per-request block tables for incremental decode (allocate from a free pool)."""
++
++    __slots__ = (
++        "_handoff",
++        "_num_layers",
++        "_layers",
++        "_block_tables",
++        "_num_computed",
++        "_free_blocks",
++        "_expected_dtype",
++        "_expected_shape",
++    )
++
++    def __init__(self, handoff: MigrationHandoff) -> None:
++        self._handoff: Final = handoff
++        n = handoff.num_layers
++        self._num_layers = n
++        if n <= 0:
++            raise ValueError("handoff.num_layers must be positive")
++        if handoff.batch_size != len(handoff.requests):
++            raise ValueError(
++                f"batch_size {handoff.batch_size} != len(requests) "
++                f"{len(handoff.requests)}"
++            )
++        if not handoff.requests:
++            raise ValueError("migration handoff has no requests")
++
++        num_blocks = handoff.shadow_num_blocks
++        block_size = handoff.block_size
++        assigned: set[int] = set()
++        for ri, req in enumerate(handoff.requests):
++            for bid in req.dst_block_table:
++                if bid < 0 or bid >= num_blocks:
++                    raise ValueError(
++                        f"request {ri}: dst_block_table entry {bid} out of range "
++                        f"[0, {num_blocks})"
++                    )
++                if bid in assigned:
++                    raise ValueError(
++                        f"request {ri}: duplicate physical block {bid} across handoff"
++                    )
++                assigned.add(bid)
++            need = _required_blocks(req.num_computed_tokens, block_size)
++            if len(req.dst_block_table) < need:
++                raise ValueError(
++                    f"request {ri}: len(dst_block_table)={len(req.dst_block_table)} "
++                    f"< required {need} for num_computed_tokens="
++                    f"{req.num_computed_tokens} block_size={block_size}"
++                )
++
++        self._block_tables = [list(r.dst_block_table) for r in handoff.requests]
++        self._num_computed = [int(r.num_computed_tokens) for r in handoff.requests]
++
++        free_sorted = sorted(i for i in range(num_blocks) if i not in assigned)
++        self._free_blocks: list[int] = free_sorted
++
++        self._expected_dtype = torch_dtype_from_str(handoff.dtype)
++        self._expected_shape = (
++            2,
++            num_blocks,
++            handoff.num_kv_heads,
++            block_size,
++            handoff.head_dim,
++        )
++
++        self._layers: list[MemfdTensor | None] = [None] * n
++
++        logger.debug(
++            "ShadowKvManager migration_id=%s shadow_num_blocks=%s free_blocks=%d",
++            handoff.migration_id,
++            num_blocks,
++            len(self._free_blocks),
++        )
++
++    @property
++    def handoff(self) -> MigrationHandoff:
++        return self._handoff
++
++    @property
++    def block_tables(self) -> list[list[int]]:
++        return self._block_tables
++
++    @property
++    def num_computed(self) -> list[int]:
++        return self._num_computed
++
++    def register_layer(
++        self,
++        layer_idx: int,
++        tensor: MemfdTensor,
++    ) -> None:
++        if layer_idx < 0 or layer_idx >= self._num_layers:
++            raise ValueError(f"layer_idx out of range: {layer_idx}")
++        if self._layers[layer_idx] is not None:
++            raise ValueError(f"KV already registered for layer {layer_idx}")
++        t = tensor.tensor.detach()
++        if t.device.type != "cpu":
++            raise ValueError("layer KV tensor must be on CPU")
++        if not t.is_contiguous():
++            raise ValueError("layer KV tensor must be contiguous")
++        if tuple(t.shape) != self._expected_shape:
++            raise ValueError(
++                f"layer KV shape {tuple(t.shape)} != expected {self._expected_shape}"
++            )
++        if t.dtype != self._expected_dtype:
++            raise ValueError(
++                f"layer KV dtype {t.dtype} != expected {self._expected_dtype}"
++            )
++        self._layers[layer_idx] = tensor
++
++    def layer_tensor(self, layer_idx: int) -> MemfdTensor:
++        if layer_idx < 0 or layer_idx >= self._num_layers:
++            raise ValueError(f"layer_idx out of range: {layer_idx}")
++        entry = self._layers[layer_idx]
++        if entry is None:
++            raise RuntimeError(f"KV not registered for layer {layer_idx}")
++        return entry
++
++    def ensure_block_for_logical(self, req_index: int, logical_block_idx: int) -> None:
++        """Ensure ``_block_tables[req_index]`` covers ``logical_block_idx``."""
++        if req_index < 0 or req_index >= len(self._block_tables):
++            raise ValueError(f"req_index out of range: {req_index}")
++        if logical_block_idx < 0:
++            raise ValueError("logical_block_idx must be non-negative")
++        table = self._block_tables[req_index]
++        while logical_block_idx >= len(table):
++            if not self._free_blocks:
++                raise RuntimeError(
++                    "no free shadow KV slots left for block table extension "
++                    f"(req_index={req_index} logical_block_idx={logical_block_idx})"
++                )
++            table.append(self._free_blocks.pop())
++
++    def prepare_decode_step(self, req_index: int) -> None:
++        """Before the next token is generated, ensure a physical block exists for
++        ``num_computed`` (the index of the new token)."""
++        if req_index < 0 or req_index >= len(self._num_computed):
++            raise ValueError(f"req_index out of range: {req_index}")
++        pos = self._num_computed[req_index]
++        bs = self._handoff.block_size
++        logical = pos // bs
++        self.ensure_block_for_logical(req_index, logical)
++
++    def advance_num_computed(self, req_index: int, delta: int = 1) -> None:
++        """Increment cached sequence length after a decode step (blocks must already
++        cover the written positions; use :meth:`prepare_decode_step` first)."""
++        if delta <= 0:
++            raise ValueError("delta must be positive")
++        if req_index < 0 or req_index >= len(self._num_computed):
++            raise ValueError(f"req_index out of range: {req_index}")
++        self._num_computed[req_index] += delta
+diff --git a/vllm/shadow/models/__init__.py b/vllm/shadow/models/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/vllm/shadow/models/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/shadow/models/cpu_ops.py b/vllm/shadow/models/cpu_ops.py
+new file mode 100644
+index 000000000..2d59d87b2
+--- /dev/null
++++ b/vllm/shadow/models/cpu_ops.py
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Bindings to vLLM CPU custom ops (``csrc/cpu``) via ``torch.ops``.
++
++If built with GPU, import the auxiliary CPU extension from ``vllm._cpu_C``, this
++registers operations under ``torch.ops._cpu_ops``. Otherwise, import the main CPU
++extension from ``vllm._C``, this registers operations under ``torch.ops._C``.
++"""
++
++from __future__ import annotations
++
++import importlib
++import platform
++from typing import Any
++
++import torch
++
++_OPS_NS: Any | None = None
++_OPS_READY: bool = False
++
++# Python attribute on ``torch.ops`` for the CPU kernel library slice.
++_TORCH_OPS_LIB_CPU = "_C"
++_TORCH_OPS_LIB_GPU_AUX = "_cpu_ops"
++
++
++def _torch_built_with_gpu() -> bool:
++    """True when this PyTorch build targets CUDA or ROCm (vLLM GPU wheels)."""
++    return torch.version.cuda is not None or torch.version.hip is not None
++
++
++def _ops_lib_names_for_runtime() -> tuple[str, ...]:
++    """Order of ``torch.ops.<name>`` attributes to probe for CPU csrc ops."""
++    if _torch_built_with_gpu():
++        return (_TORCH_OPS_LIB_GPU_AUX, _TORCH_OPS_LIB_CPU)
++    return (_TORCH_OPS_LIB_CPU,)
++
++
++def _find_ops_ns() -> Any | None:
++    for name in _ops_lib_names_for_runtime():
++        ns = getattr(torch.ops, name, None)
++        if ns is not None and hasattr(ns, "cpu_attention_with_kv_cache"):
++            return ns
++    return None
++
++
++def _ensure_cpu_ops() -> Any:
++    global _OPS_NS, _OPS_READY
++    if _OPS_READY and _OPS_NS is not None:
++        return _OPS_NS
++    ns = _find_ops_ns()
++    if ns is not None:
++        _OPS_NS = ns
++        _OPS_READY = True
++        return _OPS_NS
++    if _torch_built_with_gpu():
++        candidates = ("vllm._cpu_C", "vllm._cpu_C_AVX2")
++    else:
++        candidates = ("vllm._C", "vllm._C_AVX2")
++    for mod in candidates:
++        try:
++            importlib.import_module(mod)
++        except ImportError:
++            continue
++        ns = _find_ops_ns()
++        if ns is not None:
++            _OPS_NS = ns
++            _OPS_READY = True
++            return _OPS_NS
++    raise RuntimeError(
++        "vLLM CPU extension is unavailable: cpu_attention_with_kv_cache missing "
++        "(GPU builds need the auxiliary CPU extension, e.g. "
++        "VLLM_BUILD_CPU_OPS_WITH_GPU=1 / vllm._cpu_C → torch.ops._cpu_ops)"
++    )
++
++
++def shadow_cpu_attn_isa(dtype: torch.dtype, block_size: int, head_dim: int) -> str:
++    if head_dim % 32 != 0 and head_dim % 16 == 0:
++        return "vec16"
++    amx = bool(getattr(torch._C._cpu, "_is_amx_tile_supported", lambda: False)())
++    machine = platform.machine().lower()
++    is_arm = machine in ("aarch64", "arm64")
++    is_s390x = machine.startswith("s390")
++    if amx and dtype == torch.bfloat16 and block_size % 32 == 0:
++        return "amx"
++    if block_size % 32 == 0:
++        if is_arm:
++            return "neon"
++        if is_s390x:
++            return "vxe"
++        return "vec"
++    return "vec16"
++
++
++def rms_norm(
++    out: torch.Tensor,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    eps: float,
++) -> None:
++    ops = _ensure_cpu_ops()
++    ops.rms_norm(out, x, weight, float(eps))
++
++
++def fused_add_rms_norm(
++    input: torch.Tensor,
++    residual: torch.Tensor,
++    weight: torch.Tensor,
++    eps: float,
++) -> None:
++    ops = _ensure_cpu_ops()
++    ops.fused_add_rms_norm(input, residual, weight, float(eps))
++
++
++def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
++    ops = _ensure_cpu_ops()
++    ops.silu_and_mul(out, x)
++
++
++def rotary_embedding(
++    positions: torch.Tensor,
++    query: torch.Tensor,
++    key: torch.Tensor | None,
++    head_size: int,
++    cos_sin_cache: torch.Tensor,
++    is_neox: bool,
++) -> None:
++    ops = _ensure_cpu_ops()
++    ops.rotary_embedding(
++        positions, query, key, int(head_size), cos_sin_cache, bool(is_neox)
++    )
++
++
++def cpu_attn_reshape_and_cache(
++    key: torch.Tensor,
++    value: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    isa: str,
++) -> None:
++    ops = _ensure_cpu_ops()
++    ops.cpu_attn_reshape_and_cache(
++        key, value, key_cache, value_cache, slot_mapping, isa
++    )
++
++
++def cpu_attn_get_scheduler_metadata(
++    *,
++    num_reqs: int,
++    num_heads: int,
++    num_kv_heads: int,
++    head_dim: int,
++    seq_lens: torch.Tensor,
++    dtype: torch.dtype,
++    query_start_loc: torch.Tensor,
++    causal: bool,
++    sliding_window_size: int,
++    isa: str,
++    enable_kv_split: bool,
++) -> torch.Tensor:
++    ops = _ensure_cpu_ops()
++    return ops.get_scheduler_metadata(
++        int(num_reqs),
++        int(num_heads),
++        int(num_kv_heads),
++        int(head_dim),
++        seq_lens,
++        dtype,
++        query_start_loc,
++        bool(causal),
++        int(sliding_window_size),
++        isa,
++        bool(enable_kv_split),
++    )
++
++
++def cpu_attention_with_kv_cache(
++    *,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    output: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    seq_lens: torch.Tensor,
++    scale: float,
++    causal: bool,
++    alibi_slopes: torch.Tensor | None,
++    sliding_window_left: int,
++    sliding_window_right: int,
++    block_table: torch.Tensor,
++    softcap: float,
++    scheduler_metadata: torch.Tensor,
++    s_aux: torch.Tensor | None,
++) -> None:
++    ops = _ensure_cpu_ops()
++    ops.cpu_attention_with_kv_cache(
++        query,
++        key_cache,
++        value_cache,
++        output,
++        query_start_loc,
++        seq_lens,
++        float(scale),
++        bool(causal),
++        alibi_slopes,
++        int(sliding_window_left),
++        int(sliding_window_right),
++        block_table,
++        float(softcap),
++        scheduler_metadata,
++        s_aux,
++    )
+diff --git a/vllm/shadow/models/llama.py b/vllm/shadow/models/llama.py
+new file mode 100644
+index 000000000..a1cf767a6
+--- /dev/null
++++ b/vllm/shadow/models/llama.py
+@@ -0,0 +1,443 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Llama 3.x–style decoder blocks (RMSNorm, GQA, SwiGLU) for shadow CPU execution."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import torch
++
++from vllm.shadow.models.hf_config import ShadowHfConfig
++from vllm.shadow.executor.kv_manager import ShadowKvManager
++from vllm.shadow.models import cpu_ops
++from vllm.shadow.models.paged_kv import (
++    ShadowCpuPagedKvAccessor,
++    ShadowPagedAttentionBatch,
++)
++from vllm.shadow.models.rotary_embedding import build_shadow_cos_sin_cache
++
++
++def _strip_model_prefix(name: str) -> str:
++    return name[6:] if name.startswith("model.") else name
++
++
++def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
++    out = torch.empty_like(x)
++    cpu_ops.rms_norm(out, x, weight, eps)
++    return out
++
++
++def _linear(
++    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
++) -> torch.Tensor:
++    return torch.nn.functional.linear(x, weight, bias)
++
++
++@dataclass(slots=True)
++class LlamaLayerWeights:
++    attn_norm: torch.Tensor
++    q_proj: torch.Tensor
++    k_proj: torch.Tensor
++    v_proj: torch.Tensor
++    o_proj: torch.Tensor
++    ffn_norm: torch.Tensor
++    gate_up_proj: torch.Tensor
++    down_proj: torch.Tensor
++    q_proj_bias: torch.Tensor | None = None
++    k_proj_bias: torch.Tensor | None = None
++    v_proj_bias: torch.Tensor | None = None
++    q_norm: torch.Tensor | None = None
++    k_norm: torch.Tensor | None = None
++    o_proj_bias: torch.Tensor | None = None
++    gate_up_bias: torch.Tensor | None = None
++    down_proj_bias: torch.Tensor | None = None
++
++
++class LlamaLikeShadowModel:
++    """Llama-style decoder on CPU with unified forward over paged KV."""
++
++    __slots__ = (
++        "hf",
++        "dtype",
++        "embed",
++        "lm_head",
++        "norm",
++        "cos_sin_cache",
++        "layers",
++        "eos_token_id",
++        "head_dim",
++        "scale",
++        "isa",
++        "sliding_window_left",
++        "sliding_window_right",
++        "scheduler_window_arg",
++    )
++
++    def __init__(
++        self,
++        hf: ShadowHfConfig,
++        dtype: torch.dtype,
++        embed: torch.Tensor,
++        lm_head: torch.Tensor,
++        norm: torch.Tensor,
++        cos_sin_cache: torch.Tensor,
++        layers: list[LlamaLayerWeights],
++        eos_token_id: int | None,
++        isa: str,
++    ) -> None:
++        self.hf = hf
++        self.dtype = dtype
++        self.embed = embed
++        self.lm_head = lm_head
++        self.norm = norm
++        self.cos_sin_cache = cos_sin_cache
++        self.layers = layers
++        self.eos_token_id = eos_token_id
++        self.head_dim = hf.head_dim
++        self.scale = float(self.head_dim**-0.5)
++        self.isa = isa
++        if hf.sliding_window is None:
++            self.sliding_window_left = -1
++            self.sliding_window_right = -1
++            self.scheduler_window_arg = -1
++        else:
++            w = int(hf.sliding_window)
++            self.sliding_window_left = w - 1
++            self.sliding_window_right = 0
++            self.scheduler_window_arg = w
++
++    def _reshape_qkv(
++        self,
++        x: torch.Tensor,
++        layer: LlamaLayerWeights,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        nh = self.hf.num_attention_heads
++        nkv = self.hf.num_key_value_heads
++        hd = self.head_dim
++        q = _linear(x, layer.q_proj, layer.q_proj_bias).view(-1, nh, hd)
++        k = _linear(x, layer.k_proj, layer.k_proj_bias).view(-1, nkv, hd)
++        v = _linear(x, layer.v_proj, layer.v_proj_bias).view(-1, nkv, hd)
++        return q, k, v
++
++    def _apply_qk_norm(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        layer: LlamaLayerWeights,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Qwen3 / Qwen2.5-style per-head RMSNorm on Q and K
++
++        (matches vLLM order: before RoPE).
++        """
++        if layer.q_norm is None or layer.k_norm is None:
++            return q, k
++        b, nh, hd = q.shape
++        q_flat = q.reshape(b * nh, hd)
++        q_out = _rms_norm(q_flat, layer.q_norm, self.hf.rms_norm_eps)
++        q = q_out.view(b, nh, hd)
++        b2, nkv, hd2 = k.shape
++        if hd2 != hd:
++            raise ValueError("k head_dim mismatch vs q")
++        k_flat = k.reshape(b2 * nkv, hd)
++        k_out = _rms_norm(k_flat, layer.k_norm, self.hf.rms_norm_eps)
++        k = k_out.view(b2, nkv, hd)
++        return q, k
++
++    def _compute_logits_from_embeddings(
++        self,
++        h: torch.Tensor,
++        positions: torch.Tensor,
++        batch: ShadowPagedAttentionBatch,
++        accessor: ShadowCpuPagedKvAccessor,
++    ) -> torch.Tensor:
++        """Run transformer layers + final norm + LM head.
++
++        logits shape ``[num_tokens, vocab]``.
++        """
++        dtype = self.dtype
++        num_reqs = int(batch.block_table.size(0))
++        scheduler_metadata = cpu_ops.cpu_attn_get_scheduler_metadata(
++            num_reqs=num_reqs,
++            num_heads=self.hf.num_attention_heads,
++            num_kv_heads=self.hf.num_key_value_heads,
++            head_dim=self.head_dim,
++            seq_lens=batch.seq_lens,
++            dtype=dtype,
++            query_start_loc=batch.query_start_loc,
++            causal=True,
++            sliding_window_size=self.scheduler_window_arg,
++            isa=self.isa,
++            enable_kv_split=True,
++        )
++        nh = self.hf.num_attention_heads
++        hd = self.head_dim
++        eps = self.hf.rms_norm_eps
++        residual: torch.Tensor | None = None
++        if not self.layers:
++            x = _rms_norm(h, self.norm, eps)
++            return _linear(x, self.lm_head, None).float()
++        for li, layer in enumerate(self.layers):
++            # Match vLLM ``LlamaDecoderLayer`` / ``Qwen2DecoderLayer``
++            # (RMSNorm + fused residual stream).
++            if residual is None:
++                residual = h
++                x = _rms_norm(h, layer.attn_norm, eps)
++            else:
++                cpu_ops.fused_add_rms_norm(h, residual, layer.attn_norm, eps)
++                x = h
++            q, k, v = self._reshape_qkv(x, layer)
++            q, k = self._apply_qk_norm(q, k, layer)
++            # CPU rotary expects last dim = num_heads * head_size
++            # (see csrc/cpu/pos_encoding.cpp).
++            q_rot = q.reshape(q.size(0), -1)
++            k_rot = k.reshape(k.size(0), -1)
++            cpu_ops.rotary_embedding(
++                positions,
++                q_rot,
++                k_rot,
++                self.head_dim,
++                self.cos_sin_cache,
++                True,
++            )
++            k_cache, v_cache = accessor.layer_kv_caches(li)
++            attn_out = torch.empty_like(q)
++            cpu_ops.cpu_attn_reshape_and_cache(
++                k,
++                v,
++                k_cache,
++                v_cache,
++                batch.slot_mapping,
++                self.isa,
++            )
++            cpu_ops.cpu_attention_with_kv_cache(
++                query=q,
++                key_cache=k_cache,
++                value_cache=v_cache,
++                output=attn_out,
++                query_start_loc=batch.query_start_loc,
++                seq_lens=batch.seq_lens,
++                scale=self.scale,
++                causal=True,
++                alibi_slopes=None,
++                sliding_window_left=self.sliding_window_left,
++                sliding_window_right=self.sliding_window_right,
++                block_table=batch.block_table,
++                softcap=0.0,
++                scheduler_metadata=scheduler_metadata,
++                s_aux=None,
++            )
++            attn_flat = attn_out.reshape(-1, nh * hd)
++            attn_hidden = _linear(attn_flat, layer.o_proj, layer.o_proj_bias)
++            cpu_ops.fused_add_rms_norm(attn_hidden, residual, layer.ffn_norm, eps)
++            h = self._mlp(layer, attn_hidden)
++        cpu_ops.fused_add_rms_norm(h, residual, self.norm, eps)
++        # Float32 logits: bf16/half argmax is unstable vs GPU and hurts greedy decode.
++        return _linear(h, self.lm_head, None).float()
++
++    def forward_query_logits(
++        self,
++        request_indices: list[int],
++        query_token_ids_per_req: list[list[int]],
++        kv_manager: ShadowKvManager,
++        accessor: ShadowCpuPagedKvAccessor,
++    ) -> torch.Tensor:
++        """Run a forward pass over scheduled query tokens, return last-position logits.
++
++        Returns float32 logits ``[len(request_indices), vocab]``.  Each request
++        processes ``len(query_token_ids_per_req[i])`` new tokens starting at
++        ``kv_manager.num_computed[ri]``.  Decode is the special case where every
++        chunk has length 1.
++
++        Callers must bump ``kv_manager.num_computed`` after this returns.
++        """
++        if len(request_indices) != len(query_token_ids_per_req):
++            raise ValueError(
++                "request_indices and query_token_ids_per_req length mismatch"
++            )
++        if not request_indices:
++            raise ValueError("empty batch")
++
++        device = self.embed.device
++        query_lens = [len(ch) for ch in query_token_ids_per_req]
++        if any(L <= 0 for L in query_lens):
++            raise ValueError("each query chunk must be non-empty")
++
++        handoff = kv_manager.handoff
++        bs = int(handoff.block_size)
++        for ri, chunk in zip(request_indices, query_token_ids_per_req, strict=True):
++            start = int(kv_manager.num_computed[ri])
++            for pos in range(start, start + len(chunk)):
++                kv_manager.ensure_block_for_logical(ri, pos // bs)
++
++        emb_parts: list[torch.Tensor] = []
++        pos_parts: list[torch.Tensor] = []
++        for ri, chunk in zip(request_indices, query_token_ids_per_req, strict=True):
++            ids = torch.tensor(chunk, dtype=torch.long, device=device)
++            emb_parts.append(torch.nn.functional.embedding(ids, self.embed))
++            start = int(kv_manager.num_computed[ri])
++            pos_parts.append(
++                torch.arange(start, start + len(chunk), dtype=torch.long, device=device)
++            )
++        h = torch.cat(emb_parts, dim=0)
++        positions = torch.cat(pos_parts, dim=0)
++
++        batch = accessor.build_attention_batch(request_indices, query_lens)
++        logits_flat = self._compute_logits_from_embeddings(
++            h, positions, batch, accessor
++        )
++        qsl = batch.query_start_loc
++        last_idx = (qsl[1:] - 1).to(device=device, dtype=torch.int64)
++        return logits_flat[last_idx]
++
++    def _mlp(self, layer: LlamaLayerWeights, x: torch.Tensor) -> torch.Tensor:
++        gate_up = _linear(x, layer.gate_up_proj, layer.gate_up_bias)
++        inter = torch.empty(
++            (x.size(0), layer.down_proj.size(1)),
++            dtype=x.dtype,
++            device=x.device,
++        )
++        cpu_ops.silu_and_mul(inter, gate_up)
++        return _linear(inter, layer.down_proj, layer.down_proj_bias)
++
++
++def _pick(
++    weights: dict[str, torch.Tensor],
++    *candidates: str,
++) -> torch.Tensor:
++    for c in candidates:
++        if c in weights:
++            return weights[c]
++    raise KeyError(f"missing weight, tried: {candidates}")
++
++
++def _load_qkv_biases(
++    w: dict[str, torch.Tensor], p: str, layer_idx: int
++) -> tuple[
++    torch.Tensor | None,
++    torch.Tensor | None,
++    torch.Tensor | None,
++]:
++    """Load Q/K/V projection biases (Qwen2-style: all present or all omitted)."""
++    qb, kb, vb = f"{p}q_proj.bias", f"{p}k_proj.bias", f"{p}v_proj.bias"
++    present = sum(1 for k in (qb, kb, vb) if k in w)
++    if present == 0:
++        return None, None, None
++    if present != 3:
++        raise KeyError(
++            f"layer {layer_idx}: expected all or none of {qb}, {kb}, {vb} "
++            f"(found {present}/3)"
++        )
++    return w[qb], w[kb], w[vb]
++
++
++def _load_gate_up_bias(
++    w: dict[str, torch.Tensor], layer_idx: int
++) -> torch.Tensor | None:
++    """Merged gate+up bias (``MergedColumnParallelLinear`` / HF split tensors).
++
++    Both or neither biases must be present.
++    """
++    gb = f"layers.{layer_idx}.mlp.gate_proj.bias"
++    ub = f"layers.{layer_idx}.mlp.up_proj.bias"
++    ng, nu = gb in w, ub in w
++    if ng and nu:
++        return torch.cat([w[gb], w[ub]], dim=0)
++    if not ng and not nu:
++        return None
++    raise KeyError(
++        f"layer {layer_idx}: expected both or neither of {gb} and {ub} "
++        f"(gate={ng}, up={nu})"
++    )
++
++
++def _load_qk_norm_weights(
++    w: dict[str, torch.Tensor], p: str, layer_idx: int
++) -> tuple[torch.Tensor | None, torch.Tensor | None]:
++    """Per-head Q/K RMSNorm weights (Qwen3 / optional Qwen2 ``qk_norm``).
++
++    Both or neither weights must be present.
++    """
++    qn_path = f"{p}q_norm.weight"
++    kn_path = f"{p}k_norm.weight"
++    nq, nk = qn_path in w, kn_path in w
++    if nq and nk:
++        return w[qn_path], w[kn_path]
++    if not nq and not nk:
++        return None, None
++    raise KeyError(
++        f"layer {layer_idx}: expected both {qn_path} and {kn_path} for QK norm "
++        f"(q_norm={nq}, k_norm={nk})"
++    )
++
++
++def build_llama_like_model(
++    hf: ShadowHfConfig,
++    weights: dict[str, torch.Tensor],
++    dtype: torch.dtype,
++    *,
++    block_size: int,
++) -> LlamaLikeShadowModel:
++    """Build from HF-style ``state_dict`` keys (``model.`` prefix optional)."""
++    w: dict[str, torch.Tensor] = {_strip_model_prefix(k): v for k, v in weights.items()}
++    device = torch.device("cpu")
++
++    embed = _pick(w, "embed_tokens.weight")
++    lm_head = w.get("lm_head.weight", embed)
++
++    norm = _pick(w, "norm.weight")
++
++    cos_sin = build_shadow_cos_sin_cache(hf, dtype=dtype, device=device)
++
++    layers: list[LlamaLayerWeights] = []
++    L = hf.num_hidden_layers
++    for i in range(L):
++        p = f"layers.{i}.self_attn."
++        q = _pick(w, f"{p}q_proj.weight")
++        k = _pick(w, f"{p}k_proj.weight")
++        v = _pick(w, f"{p}v_proj.weight")
++        o = _pick(w, f"{p}o_proj.weight")
++        o_bias = w.get(f"{p}o_proj.bias", None)
++        q_b, k_b, v_b = _load_qkv_biases(w, p, i)
++        gate = _pick(w, f"layers.{i}.mlp.gate_proj.weight")
++        up = _pick(w, f"layers.{i}.mlp.up_proj.weight")
++        gate_up = torch.cat([gate, up], dim=0)
++        gate_up_b = _load_gate_up_bias(w, i)
++        down = _pick(w, f"layers.{i}.mlp.down_proj.weight")
++        down_b = w.get(f"layers.{i}.mlp.down_proj.bias", None)
++        attn_norm = _pick(w, f"layers.{i}.input_layernorm.weight")
++        ffn_norm = _pick(w, f"layers.{i}.post_attention_layernorm.weight")
++        q_norm, k_norm = _load_qk_norm_weights(w, p, i)
++        layers.append(
++            LlamaLayerWeights(
++                attn_norm=attn_norm,
++                q_proj=q,
++                k_proj=k,
++                v_proj=v,
++                o_proj=o,
++                ffn_norm=ffn_norm,
++                gate_up_proj=gate_up,
++                down_proj=down,
++                q_proj_bias=q_b,
++                k_proj_bias=k_b,
++                v_proj_bias=v_b,
++                q_norm=q_norm,
++                k_norm=k_norm,
++                o_proj_bias=o_bias,
++                gate_up_bias=gate_up_b,
++                down_proj_bias=down_b,
++            )
++        )
++
++    isa = cpu_ops.shadow_cpu_attn_isa(dtype, int(block_size), hf.head_dim)
++    return LlamaLikeShadowModel(
++        hf,
++        dtype,
++        embed,
++        lm_head,
++        norm,
++        cos_sin,
++        layers,
++        hf.eos_token_id,
++        isa,
++    )
+diff --git a/vllm/shadow/models/model_runner.py b/vllm/shadow/models/model_runner.py
+new file mode 100644
+index 000000000..ef23af755
+--- /dev/null
++++ b/vllm/shadow/models/model_runner.py
+@@ -0,0 +1,118 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Eager CPU decoder for shadow migration (Llama / Qwen2 / Qwen3–style checkpoints)."""
++
++from __future__ import annotations
++
++import logging
++import time
++
++import torch
++
++from vllm.shadow.config.config import ShadowConfig
++from vllm.shadow.models.hf_config import load_shadow_hf_config
++from vllm.shadow.executor.kv_manager import ShadowKvManager
++from vllm.shadow.models.llama import LlamaLikeShadowModel, build_llama_like_model
++from vllm.shadow.models.paged_kv import ShadowCpuPagedKvAccessor
++from vllm.shadow.models.sampling import (
++    ShadowSamplingParams,
++    sample_from_logits,
++    should_stop,
++)
++from vllm.shadow.models.weight_loader import ShadowWeightsLoader
++
++logger = logging.getLogger("vllm.shadow.models.model_runner")
++
++__all__ = ("ShadowModelRunner",)
++
++
++class ShadowModelRunner:
++    """Loads HF weights once, then runs unified forward steps."""
++
++    __slots__ = ("_decoder",)
++
++    def __init__(self, decoder: LlamaLikeShadowModel) -> None:
++        self._decoder = decoder
++
++    @property
++    def eos_token_id(self) -> int | None:
++        return self._decoder.eos_token_id
++
++    @classmethod
++    def load_from_config(cls, shadow_config: ShadowConfig) -> ShadowModelRunner:
++        loader = ShadowWeightsLoader(shadow_config)
++        hf = load_shadow_hf_config(loader.model_dir)
++
++        dtype = shadow_config.dtype
++        if not isinstance(dtype, torch.dtype):
++            raise TypeError("ShadowConfig.dtype must be resolved to torch.dtype")
++
++        t0 = time.perf_counter()
++        weights: dict[str, torch.Tensor] = {}
++        for name, tensor in loader.iter_tensors():
++            weights[name] = tensor.to(
++                dtype=dtype, device=torch.device("cpu")
++            ).contiguous()
++
++        if hf.model_type in (
++            "qwen2",
++            "qwen3",
++            "llama",
++        ):
++            decoder = build_llama_like_model(
++                hf, weights, dtype, block_size=shadow_config.block_size
++            )
++        else:
++            raise ValueError(
++                f"unsupported shadow model_type={hf.model_type!r} "
++                f"(architectures={hf.architectures}); "
++                "supported: llama (incl. Llama 3.x), mistral, stablelm, qwen2, qwen3"
++            )
++
++        del weights
++        elapsed_ms = (time.perf_counter() - t0) * 1000.0
++
++        logger.info(
++            "Shadow CPU model loaded model_type=%s dtype=%s layers=%d time_ms=%.1f",
++            hf.model_type,
++            dtype,
++            hf.num_hidden_layers,
++            elapsed_ms,
++        )
++        return cls(decoder)
++
++    def logits_step(
++        self,
++        request_indices: list[int],
++        query_token_ids_per_req: list[list[int]],
++        kv_manager: ShadowKvManager,
++        kv_accessor: ShadowCpuPagedKvAccessor,
++    ) -> torch.Tensor:
++        """Run one forward step and return float32 logits ``[batch, vocab]``."""
++        return self._decoder.forward_query_logits(
++            request_indices,
++            query_token_ids_per_req,
++            kv_manager,
++            kv_accessor,
++        )
++
++    def generate_step(
++        self,
++        request_indices: list[int],
++        sampling_params: list[ShadowSamplingParams],
++        token_ids: list[int],
++        kv_manager: ShadowKvManager,
++        kv_accessor: ShadowCpuPagedKvAccessor,
++    ) -> list[tuple[int, bool]]:
++        logits = self.logits_step(
++            request_indices,
++            [[t] for t in token_ids],
++            kv_manager,
++            kv_accessor,
++        )
++        out: list[tuple[int, bool]] = []
++        for i in range(logits.size(0)):
++            tid = sample_from_logits(logits[i], sampling_params[i])
++            stopped = should_stop(tid, sampling_params[i], self.eos_token_id)
++            out.append((tid, stopped))
++        return out
+diff --git a/vllm/shadow/models/paged_kv.py b/vllm/shadow/models/paged_kv.py
+new file mode 100644
+index 000000000..6f1868edb
+--- /dev/null
++++ b/vllm/shadow/models/paged_kv.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paged KV views and per-step batch tensors for CPU paged attention."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import torch
++
++from vllm.shadow.executor.kv_manager import ShadowKvManager
++
++
++@dataclass(slots=True)
++class ShadowPagedAttentionBatch:
++    """Batch metadata for CPU paged attention (unified decode + prefill).
++
++    ``slot_mapping`` has length ``sum(query_lens)`` in request order (same token
++    order as the flattened hidden states / QKV tensors).  ``seq_lens`` has length
++    ``len(request_indices)`` — the CPU kernel indexes KV length and block tables
++    **per request**, not per token.
++    """
++
++    block_table: torch.Tensor
++    slot_mapping: torch.Tensor
++    seq_lens: torch.Tensor
++    query_start_loc: torch.Tensor
++    max_seq_len: int
++
++
++class ShadowCpuPagedKvAccessor:
++    """Builds block tables and slot mappings pointing at layer KV caches."""
++
++    __slots__ = ("_kv",)
++
++    def __init__(self, kv: ShadowKvManager) -> None:
++        self._kv = kv
++
++    def layer_kv_caches(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
++        """K/V per layer, shape ``[num_blocks, num_kv_heads, block_size, head_dim]``.
++
++        **K** uses the packed tile layout from ``gather_kv_blocks`` /
++        ``cpu_attn_reshape_and_cache``; **V** is row-major ``(slot, dim)`` in the
++        last two axes (HND / flash-style).
++        """
++        mem = self._kv.layer_tensor(layer_idx).tensor
++        if mem.dim() != 5 or mem.size(0) != 2:
++            raise ValueError("expected layer KV shape [2, num_blocks, ...]")
++        k = mem[0]
++        v = mem[1]
++        if not k.is_contiguous():
++            k = k.contiguous()
++            v = v.contiguous()
++        return k, v
++
++    def build_attention_batch(
++        self,
++        batch_req_indices: list[int],
++        query_lens: list[int],
++    ) -> ShadowPagedAttentionBatch:
++        """Build unified batch metadata for ``query_lens`` new tokens per request.
++
++        Decode is the special case where every entry in *query_lens* is 1.
++        """
++        if not batch_req_indices:
++            raise ValueError("empty batch")
++        if len(batch_req_indices) != len(query_lens):
++            raise ValueError("batch_req_indices and query_lens length mismatch")
++        if any(L <= 0 for L in query_lens):
++            raise ValueError("query_lens must be positive")
++
++        handoff = self._kv.handoff
++        block_size = int(handoff.block_size)
++        tables = self._kv.block_tables
++        num_computed = self._kv.num_computed
++
++        n = len(batch_req_indices)
++        max_blocks = max(len(tables[ri]) for ri in batch_req_indices)
++        block_table = torch.zeros((n, max_blocks), dtype=torch.int32)
++
++        total_tokens = sum(query_lens)
++        slot_mapping = torch.empty((total_tokens,), dtype=torch.int64)
++        seq_after: list[int] = []
++        sm = 0
++        for row, (ri, L) in enumerate(zip(batch_req_indices, query_lens, strict=True)):
++            blks = tables[ri]
++            nb = len(blks)
++            if nb > max_blocks:
++                raise RuntimeError("internal: max_blocks too small")
++            block_table[row, :nb] = torch.tensor(blks, dtype=torch.int32)
++            start = int(num_computed[ri])
++            seq_after.append(start + L)
++            for j in range(L):
++                pos = start + j
++                logical_block = pos // block_size
++                if logical_block >= len(blks):
++                    raise RuntimeError(
++                        "block table too short for position "
++                        f"(req={ri} pos={pos} logical_block={logical_block})"
++                    )
++                phys = int(blks[logical_block])
++                slot_mapping[sm + j] = phys * block_size + (pos % block_size)
++            sm += L
++
++        seq_lens = torch.tensor(seq_after, dtype=torch.int32)
++        lens_t = torch.tensor(query_lens, dtype=torch.int32)
++        qsl = torch.zeros((n + 1,), dtype=torch.int32)
++        qsl[1:] = torch.cumsum(lens_t, dim=0)
++        max_seq = int(seq_lens.max().item())
++        return ShadowPagedAttentionBatch(
++            block_table=block_table,
++            slot_mapping=slot_mapping,
++            seq_lens=seq_lens,
++            query_start_loc=qsl,
++            max_seq_len=max_seq,
++        )
+diff --git a/vllm/shadow/models/rotary_embedding.py b/vllm/shadow/models/rotary_embedding.py
+new file mode 100644
+index 000000000..446efd5f8
+--- /dev/null
++++ b/vllm/shadow/models/rotary_embedding.py
+@@ -0,0 +1,124 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GPT-NeoX style RoPE ``cos_sin`` cache for shadow CPU.
++
++Only ``default`` and ``llama3`` are supported.
++"""
++
++from __future__ import annotations
++
++import math
++from typing import Any
++
++import torch
++
++from vllm.shadow.models.hf_config import ShadowHfConfig
++
++
++def _inv_freq_standard(
++    rotary_dim: int, base: float, device: torch.device
++) -> torch.Tensor:
++    return 1.0 / (
++        base
++        ** (
++            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
++            / rotary_dim
++        )
++    )
++
++
++def _cos_sin_table(
++    inv_freq: torch.Tensor,
++    num_rows: int,
++    *,
++    device: torch.device,
++) -> torch.Tensor:
++    t = torch.arange(num_rows, dtype=torch.float32, device=device)
++    freqs = torch.outer(t, inv_freq)
++    cos = freqs.cos()
++    sin = freqs.sin()
++    return torch.cat((cos, sin), dim=-1)
++
++
++def _inv_freq_llama3(
++    rotary_dim: int,
++    base: float,
++    device: torch.device,
++    *,
++    scaling_factor: float,
++    low_freq_factor: float,
++    high_freq_factor: float,
++    orig_max_position: int,
++) -> torch.Tensor:
++    inv_freqs = _inv_freq_standard(rotary_dim, base, device)
++    low_freq_wavelen = orig_max_position / low_freq_factor
++    high_freq_wavelen = orig_max_position / high_freq_factor
++    wave_len = 2 * math.pi / inv_freqs
++    if low_freq_factor != high_freq_factor:
++        smooth = (orig_max_position / wave_len - low_freq_factor) / (
++            high_freq_factor - low_freq_factor
++        )
++    else:
++        smooth = 0
++    return torch.where(
++        wave_len < high_freq_wavelen,
++        inv_freqs,
++        torch.where(
++            wave_len > low_freq_wavelen,
++            inv_freqs / scaling_factor,
++            (1 - smooth) * inv_freqs / scaling_factor + smooth * inv_freqs,
++        ),
++    )
++
++
++def _unsupported_rope(rope_type: str) -> None:
++    raise ValueError(
++        f"shadow RoPE: unsupported rope_type {rope_type!r} "
++        f"(only 'default' and 'llama3' are supported)"
++    )
++
++
++def build_shadow_cos_sin_cache(
++    hf: ShadowHfConfig,
++    dtype: torch.dtype,
++    device: torch.device,
++) -> torch.Tensor:
++    """Materialize ``cos_sin_cache`` ``[num_rows, rotary_dim]``."""
++    rp: dict[str, Any] = hf.rope_parameters
++    rope_type = str(rp["rope_type"])
++    rotary_dim = int(hf.rotary_dim)
++    max_pe = int(hf.max_position_embeddings)
++    base = float(rp["rope_theta"])
++
++    if rotary_dim <= 0 or rotary_dim > hf.head_dim or rotary_dim % 2 != 0:
++        raise ValueError(
++            f"invalid rotary_dim={rotary_dim} for RoPE (head_dim={hf.head_dim})"
++        )
++
++    if rope_type == "default":
++        inv = _inv_freq_standard(rotary_dim, base, device)
++        cache = _cos_sin_table(inv, max_pe, device=device)
++        return cache.to(dtype=dtype)
++
++    if rope_type == "llama3":
++        for key in (
++            "factor",
++            "low_freq_factor",
++            "high_freq_factor",
++            "original_max_position_embeddings",
++        ):
++            if key not in rp:
++                raise ValueError(f"llama3 RoPE requires rope_parameters[{key!r}]")
++        inv = _inv_freq_llama3(
++            rotary_dim,
++            base,
++            device,
++            scaling_factor=float(rp["factor"]),
++            low_freq_factor=float(rp["low_freq_factor"]),
++            high_freq_factor=float(rp["high_freq_factor"]),
++            orig_max_position=int(rp["original_max_position_embeddings"]),
++        )
++        cache = _cos_sin_table(inv, max_pe, device=device)
++        return cache.to(dtype=dtype)
++
++    _unsupported_rope(rope_type)
+diff --git a/vllm/shadow/models/sampling.py b/vllm/shadow/models/sampling.py
+new file mode 100644
+index 000000000..8f2407ec8
+--- /dev/null
++++ b/vllm/shadow/models/sampling.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Minimal sampling for shadow wire ``sampling_params``."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++
++__all__ = (
++    "ShadowSamplingParams",
++    "sampling_params_from_wire_dict",
++    "sample_from_logits",
++    "should_stop",
++)
++
++
++@dataclass(slots=True)
++class ShadowSamplingParams:
++    temperature: float
++    top_k: int
++    stop_token_ids: list[int]
++
++
++def sampling_params_from_wire_dict(d: dict[str, Any]) -> ShadowSamplingParams:
++    temp = float(d.get("temperature", 1.0))
++    top_k_raw = d.get("top_k", -1)
++    top_k = int(top_k_raw) if top_k_raw is not None else -1
++    stops = d.get("stop_token_ids")
++    stop_list: list[int] = []
++    if isinstance(stops, list):
++        stop_list = [int(x) for x in stops]
++    return ShadowSamplingParams(
++        temperature=max(0.0, temp),
++        top_k=top_k,
++        stop_token_ids=stop_list,
++    )
++
++
++def sample_from_logits(
++    logits: torch.Tensor,
++    params: ShadowSamplingParams,
++    *,
++    generator: torch.Generator | None = None,
++) -> int:
++    """Greedy with optional temperature / top-k (``top_k <= 0`` disables top-k)."""
++    row = logits[-1] if logits.dim() == 2 else logits
++    row = row.float()
++    if params.temperature <= 0.0:
++        return int(torch.argmax(row).item())
++    scaled = row / max(params.temperature, 1e-8)
++    if params.top_k > 0:
++        v, _ = torch.topk(scaled, min(params.top_k, scaled.numel()))
++        thresh = v[-1]
++        scaled = torch.where(scaled < thresh, float("-inf"), scaled)
++    probs = torch.softmax(scaled, dim=-1)
++    if generator is None:
++        return int(torch.multinomial(probs, num_samples=1).item())
++    return int(torch.multinomial(probs, num_samples=1, generator=generator).item())
++
++
++def should_stop(
++    token_id: int,
++    params: ShadowSamplingParams,
++    eos_token_id: int | None,
++) -> bool:
++    if eos_token_id is not None and token_id == eos_token_id:
++        return True
++    return token_id in params.stop_token_ids
+diff --git a/vllm/shadow/models/weight_loader.py b/vllm/shadow/models/weight_loader.py
+new file mode 100644
+index 000000000..f5ebafb24
+--- /dev/null
++++ b/vllm/shadow/models/weight_loader.py
+@@ -0,0 +1,190 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Shadow-local weight loader for CPU model execution.
++
++Loads safetensors (or .bin/.pt fallback) from a local directory or
++HuggingFace model id, streaming tensors one-at-a-time in the style of
++vLLM's weight iterators — without importing the heavy vLLM runtime.
++"""
++
++from __future__ import annotations
++
++import glob
++import json
++import logging
++import os
++from collections.abc import Iterator
++
++import regex as re
++import torch
++from safetensors.torch import safe_open
++
++from vllm.shadow.config.config import ShadowConfig
++
++logger = logging.getLogger("vllm.shadow.models.weight_loader")
++
++__all__ = ("ShadowWeightsLoader",)
++
++
++def _natural_sort_key(filepath: str) -> list:
++    """Natural sort key so ``model-00002`` sorts after ``model-00001``."""
++    return [
++        int(s) if s.isdigit() else s
++        for s in re.split(r"(\d+)", os.path.basename(filepath))
++    ]
++
++
++class ShadowWeightsLoader:
++    """vLLM-style weight shard iterator for the shadow CPU process."""
++
++    def __init__(self, shadow_config: ShadowConfig) -> None:
++        self._config = shadow_config
++
++        self._model_dir = self._resolve_model_dir()
++
++    # ── Model directory resolution ────────────────────────────────────
++
++    @property
++    def model_dir(self) -> str:
++        return self._model_dir
++
++    def _resolve_model_dir(self) -> str:
++        """Resolve ``shadow_config.model`` to a local directory.
++
++        If the model string is already a local directory it is used as-is.
++        Otherwise ``huggingface_hub.snapshot_download`` fetches the
++        checkpoint (safetensors + JSON config files).
++        """
++        model = self._config.model
++
++        if os.path.isdir(model):
++            logger.info("Using local model directory: %s", model)
++            return model
++
++        from huggingface_hub import snapshot_download
++
++        logger.info("Downloading model %s ...", model)
++        model = snapshot_download(
++            repo_id=model,
++            allow_patterns=[
++                "*.safetensors",
++                "*.safetensors.index.json",
++                "*.json",
++                "*.bin",
++                "*.pt",
++            ],
++        )
++
++        logger.info("Model resolved to: %s", model)
++        return model
++
++    # ── Shard discovery ───────────────────────────────────────────────
++
++    def _discover_safetensors(self, model_dir: str) -> list[str]:
++        """Return an ordered list of safetensors shard paths.
++
++        Prefers the ``model.safetensors.index.json`` weight map when
++        present; otherwise falls back to a natural-sorted glob.
++        """
++        index_path = os.path.join(model_dir, "model.safetensors.index.json")
++        if os.path.isfile(index_path):
++            with open(index_path) as f:
++                weight_map: dict[str, str] = json.load(f)["weight_map"]
++            unique_shards: list[str] = list(dict.fromkeys(weight_map.values()))
++            paths = [os.path.join(model_dir, s) for s in unique_shards]
++            logger.info("Discovered %d safetensors shards via index file", len(paths))
++            return paths
++
++        paths = sorted(
++            glob.glob(os.path.join(model_dir, "*.safetensors")),
++            key=_natural_sort_key,
++        )
++        if paths:
++            logger.info("Discovered %d safetensors shards via glob", len(paths))
++        return paths
++
++    def _discover_bin_pt(self, model_dir: str) -> list[str]:
++        """Return an ordered list of ``.bin`` / ``.pt`` shard paths."""
++        paths = sorted(
++            glob.glob(os.path.join(model_dir, "*.bin"))
++            + glob.glob(os.path.join(model_dir, "*.pt")),
++            key=_natural_sort_key,
++        )
++        blacklist = {
++            "training_args.bin",
++            "optimizer.bin",
++            "optimizer.pt",
++            "scheduler.pt",
++            "scaler.pt",
++        }
++        paths = [p for p in paths if os.path.basename(p) not in blacklist]
++        if paths:
++            logger.info("Discovered %d .bin/.pt shards via glob", len(paths))
++        return paths
++
++    # ── Tensor iterators ──────────────────────────────────────────────
++
++    def iter_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
++        """Yield ``(name, tensor)`` pairs from the checkpoint.
++
++        Tries safetensors first; falls back to ``.bin``/``.pt`` if none
++        are found.
++        """
++        model_dir = self.model_dir
++        st_files = self._discover_safetensors(model_dir)
++
++        if st_files:
++            yield from self._iter_safetensors(st_files)
++            return
++
++        bin_files = self._discover_bin_pt(model_dir)
++        if bin_files:
++            logger.warning("No safetensors found; falling back to .bin/.pt loading")
++            yield from self._iter_bin_pt(bin_files)
++            return
++
++        raise FileNotFoundError(
++            f"No safetensors or .bin/.pt weight files found in {model_dir}"
++        )
++
++    def _iter_safetensors(
++        self,
++        shard_files: list[str],
++    ) -> Iterator[tuple[str, torch.Tensor]]:
++        for shard_path in shard_files:
++            logger.debug("Loading shard %s", shard_path)
++            with safe_open(shard_path, framework="pt", device="cpu") as f:
++                for name in f.keys():  # noqa: SIM118
++                    tensor = f.get_tensor(name)
++                    self._warn_dtype_mismatch(name, tensor.dtype)
++                    yield name, tensor
++
++    def _iter_bin_pt(
++        self,
++        shard_files: list[str],
++    ) -> Iterator[tuple[str, torch.Tensor]]:
++        for shard_path in shard_files:
++            logger.debug("Loading .bin/.pt shard %s", shard_path)
++            state = torch.load(shard_path, map_location="cpu", weights_only=True)
++            for name, tensor in state.items():
++                self._warn_dtype_mismatch(name, tensor.dtype)
++                yield name, tensor
++            del state
++
++    # ── Helpers ────────────────────────────────────────────────────────
++
++    def _warn_dtype_mismatch(self, name: str, tensor_dtype: torch.dtype) -> None:
++        expected = self._config.dtype
++        if not isinstance(expected, torch.dtype):
++            return
++        if (
++            tensor_dtype.is_floating_point
++            and expected.is_floating_point
++            and tensor_dtype != expected
++        ):
++            logger.debug(
++                "Weight %s has dtype %s (config expects %s)",
++                name,
++                tensor_dtype,
++                expected,
++            )

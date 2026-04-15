@@ -814,6 +814,13 @@ COPY examples/online_serving/sagemaker-entrypoint.sh .
 RUN chmod +x sagemaker-entrypoint.sh
 ENTRYPOINT ["./sagemaker-entrypoint.sh"]
 
+FROM vllm-openai-base AS vllm-openai-shadow
+
+COPY docker/vllm-shadow-entrypoint.sh /usr/local/bin/vllm-shadow-entrypoint
+RUN chmod +x /usr/local/bin/vllm-shadow-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/vllm-shadow-entrypoint"]
+
 FROM vllm-openai-base AS vllm-openai
 
 ENTRYPOINT ["vllm", "serve"]
