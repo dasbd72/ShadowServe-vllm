@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
     VLLM_CPU_SGL_KERNEL: bool = False
+    VLLM_BUILD_CPU_OPS_WITH_GPU: bool = False
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 16 * 1024
@@ -711,6 +712,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     else None,
     # (CPU backend only) whether to use SGL kernels, optimized for small batch.
     "VLLM_CPU_SGL_KERNEL": lambda: bool(int(os.getenv("VLLM_CPU_SGL_KERNEL", "0"))),
+    # When building a CUDA/ROCm wheel from source, also compile csrc/cpu into
+    # ``vllm._cpu_C`` (ops live under ``torch.ops._cpu_ops``; see setup.py /
+    # CMake ``VLLM_BUILD_CPU_EXT_AS_GPU_AUX``).
+    "VLLM_BUILD_CPU_OPS_WITH_GPU": lambda: bool(
+        int(os.getenv("VLLM_BUILD_CPU_OPS_WITH_GPU", "0"))
+    ),
     # If the env var is set, Ray Compiled Graph uses the specified
     # channel type to communicate between workers belonging to
     # different pipeline-parallel stages.
@@ -1785,6 +1792,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
+        "VLLM_BUILD_CPU_OPS_WITH_GPU",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_TEST_FORCE_LOAD_FORMAT",
         "VLLM_ENABLE_CUDA_COMPATIBILITY",

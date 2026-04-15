@@ -1,5 +1,20 @@
 include(FetchContent)
 
+# Standalone CPU backend uses `_C` / `_C_AVX2`. When this file is included from
+# the GPU CMake graph (`VLLM_BUILD_CPU_EXT_AS_GPU_AUX`), use distinct CMake
+# target names so we do not collide with the CUDA/HIP `vllm._C` extension.
+# Torch op registration: standalone uses ``torch.ops._C``; GPU auxiliary
+# shards use ``torch.ops._cpu_ops`` (see ``VLLM_CPU_TORCH_OPS_LIBRARY_NAME``).
+if(VLLM_BUILD_CPU_EXT_AS_GPU_AUX)
+  set(VLLM_CPU_EXT_MAIN_TARGET "_cpu_C")
+  set(VLLM_CPU_EXT_AVX2_TARGET "_cpu_C_AVX2")
+  set(VLLM_CPU_EXT_DNNL_OBJ_TARGET "dnnl_ext_gpu_aux")
+else()
+  set(VLLM_CPU_EXT_MAIN_TARGET "_C")
+  set(VLLM_CPU_EXT_AVX2_TARGET "_C_AVX2")
+  set(VLLM_CPU_EXT_DNNL_OBJ_TARGET "dnnl_ext")
+endif()
+
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS ON)
@@ -277,16 +292,16 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
     set(CMAKE_BUILD_TYPE "Release") # remove oneDNN debug symbols to reduce size
     FetchContent_MakeAvailable(oneDNN)
     set(CMAKE_BUILD_TYPE ${VLLM_BUILD_TYPE})
-    add_library(dnnl_ext OBJECT "csrc/cpu/dnnl_helper.cpp")
+    add_library(${VLLM_CPU_EXT_DNNL_OBJ_TARGET} OBJECT "csrc/cpu/dnnl_helper.cpp")
     target_include_directories(
-        dnnl_ext
+        ${VLLM_CPU_EXT_DNNL_OBJ_TARGET}
         PUBLIC ${oneDNN_SOURCE_DIR}/include
         PUBLIC ${oneDNN_BINARY_DIR}/include
         PRIVATE ${oneDNN_SOURCE_DIR}/src
     )
-    target_link_libraries(dnnl_ext dnnl torch)
-    target_compile_options(dnnl_ext PRIVATE ${DNNL_COMPILE_FLAGS} -fPIC)
-    list(APPEND LIBS dnnl_ext)
+    target_link_libraries(${VLLM_CPU_EXT_DNNL_OBJ_TARGET} dnnl torch)
+    target_compile_options(${VLLM_CPU_EXT_DNNL_OBJ_TARGET} PRIVATE ${DNNL_COMPILE_FLAGS} -fPIC)
+    list(APPEND LIBS ${VLLM_CPU_EXT_DNNL_OBJ_TARGET})
     set(USE_ONEDNN ON)
 else()
     set(USE_ONEDNN OFF)
@@ -345,6 +360,12 @@ if(USE_ONEDNN)
         ${VLLM_EXT_SRC})
 endif()
 
+if(VLLM_BUILD_CPU_EXT_AS_GPU_AUX)
+    set(VLLM_CPU_TORCH_OPS_LIB_TOKEN _cpu_ops)
+else()
+    set(VLLM_CPU_TORCH_OPS_LIB_TOKEN _C)
+endif()
+
 if (ENABLE_X86_ISA)
     set(VLLM_EXT_SRC_AVX512
         "csrc/cpu/sgl-kernels/gemm.cpp"
@@ -382,7 +403,7 @@ if (ENABLE_X86_ISA)
     message(STATUS "CPU extension (AVX2) source files: ${VLLM_EXT_SRC_AVX2}")
 
     define_extension_target(
-        _C
+        ${VLLM_CPU_EXT_MAIN_TARGET}
         DESTINATION vllm
         LANGUAGE CXX
         SOURCES ${VLLM_EXT_SRC_AVX512}
@@ -393,12 +414,12 @@ if (ENABLE_X86_ISA)
     )
 
     # For SGL kernels
-    target_compile_definitions(_C PRIVATE "-DCPU_CAPABILITY_AVX512")
+    target_compile_definitions(${VLLM_CPU_EXT_MAIN_TARGET} PRIVATE "-DCPU_CAPABILITY_AVX512")
     # For AMX kernels
-    target_compile_definitions(_C PRIVATE "-DCPU_CAPABILITY_AMXBF16")
+    target_compile_definitions(${VLLM_CPU_EXT_MAIN_TARGET} PRIVATE "-DCPU_CAPABILITY_AMXBF16")
 
     define_extension_target(
-        _C_AVX2
+        ${VLLM_CPU_EXT_AVX2_TARGET}
         DESTINATION vllm
         LANGUAGE CXX
         SOURCES ${VLLM_EXT_SRC_AVX2}
@@ -407,13 +428,18 @@ if (ENABLE_X86_ISA)
         USE_SABI 3
         WITH_SOABI
     )
+
+    target_compile_definitions(${VLLM_CPU_EXT_MAIN_TARGET} PRIVATE
+        "VLLM_CPU_TORCH_OPS_LIBRARY_NAME=${VLLM_CPU_TORCH_OPS_LIB_TOKEN}")
+    target_compile_definitions(${VLLM_CPU_EXT_AVX2_TARGET} PRIVATE
+        "VLLM_CPU_TORCH_OPS_LIBRARY_NAME=${VLLM_CPU_TORCH_OPS_LIB_TOKEN}")
 else()
     message(STATUS "CPU extension source files: ${VLLM_EXT_SRC}")
     #
     # Define extension targets
     #
     define_extension_target(
-        _C
+        ${VLLM_CPU_EXT_MAIN_TARGET}
         DESTINATION vllm
         LANGUAGE CXX
         SOURCES ${VLLM_EXT_SRC}
@@ -422,6 +448,9 @@ else()
         USE_SABI 3
         WITH_SOABI
     )
+
+    target_compile_definitions(${VLLM_CPU_EXT_MAIN_TARGET} PRIVATE
+        "VLLM_CPU_TORCH_OPS_LIBRARY_NAME=${VLLM_CPU_TORCH_OPS_LIB_TOKEN}")
 endif()
 
 message(STATUS "Enabling C extension.")

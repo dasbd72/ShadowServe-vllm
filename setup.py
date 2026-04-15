@@ -291,6 +291,9 @@ class cmake_build_ext(build_ext):
         if other_cmake_args:
             cmake_args += other_cmake_args.split()
 
+        if _build_cpu_ops_with_gpu():
+            cmake_args += ["-DVLLM_BUILD_CPU_EXT_AS_GPU_AUX=ON"]
+
         subprocess.check_call(
             ["cmake", ext.cmake_lists_dir, *build_tool, *cmake_args],
             cwd=self.build_temp,
@@ -823,6 +826,18 @@ def _build_custom_ops() -> bool:
     return _is_cuda() or _is_hip()
 
 
+def _build_cpu_ops_with_gpu() -> bool:
+    """When true, compile ``csrc/cpu`` into ``vllm._cpu_C`` (+ AVX2 on x86_64).
+
+    Kernels register as ``torch.ops._cpu_ops`` (not ``torch.ops._C``).
+    """
+    if envs.VLLM_USE_PRECOMPILED:
+        return False
+    if not (_is_cuda() or _is_hip()):
+        return False
+    return bool(int(os.getenv("VLLM_BUILD_CPU_OPS_WITH_GPU", "0")))
+
+
 def get_rocm_version():
     # Get the Rocm version from the ROCM_HOME/bin/librocm-core.so
     # see https://github.com/ROCm/rocm-core/blob/d11f5c20d500f729c393680a01fa902ebf92094b/rocm_version.cpp#L21
@@ -1005,6 +1020,13 @@ if _is_cpu():
 
 if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
+
+if _build_cpu_ops_with_gpu():
+    import platform
+
+    ext_modules.append(CMakeExtension(name="vllm._cpu_C", optional=True))
+    if platform.machine() in ("x86_64", "AMD64"):
+        ext_modules.append(CMakeExtension(name="vllm._cpu_C_AVX2", optional=True))
 
 package_data = {
     "vllm": [
