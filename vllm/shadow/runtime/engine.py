@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from http.server import ThreadingHTTPServer
 from typing import Any
 
+import requests
+
 from vllm.shadow.http.server import KvhtsHttpState, start_shadow_http_server
 from vllm.shadow.models.kv_state import ShadowKvState
 from vllm.shadow.models.llama import LlamaForCausalLM
@@ -26,6 +28,11 @@ from vllm.shadow.runtime.executor import ShadowExecutor
 from vllm.shadow.transfer.kv_transport_common import MemfdTensor
 from vllm.shadow.transfer.kvhts_memfd import UdsMemfdKvhtsReceiverTransport
 from vllm.shadow.transfer.kvhts_protocol import KvhtsHandoff
+from vllm.shadow.transfer.kvstc_memfd import UdsMemfdKvstcSenderTransport
+from vllm.shadow.transfer.kvstc_protocol import (
+    KvstcHandoff,
+    KvstcRequest,
+)
 
 logger = logging.getLogger("vllm.shadow.runtime.engine")
 
@@ -183,6 +190,123 @@ class _MigrationSession:
         )
 
 
+class _KvstcSession:
+    """Session to poll vllm and initiate the shadow migration."""
+
+    def __init__(
+        self,
+        base_api_url: str,
+        handoff: KvhtsHandoff,
+        kv_state: ShadowKvState,
+        executor: ShadowExecutor,
+    ) -> None:
+        self._base_api_url: str = base_api_url
+        self._handoff: KvhtsHandoff = handoff
+        self._kv_state: ShadowKvState = kv_state
+        self._executor: ShadowExecutor = executor
+
+        self._stop_event = threading.Event()
+
+        self._kvstc_ipc_path: str | None = None
+        self._kvstc_sender: UdsMemfdKvstcSenderTransport | None = None
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        try:
+            self._poll_health()
+            if self._stop_event.is_set():
+                return
+            self._get_migration_recv()
+            if self._stop_event.is_set():
+                return
+            self._executor.migrate()
+            self._run_migration_session()
+        finally:
+            self._stop_event.set()
+
+    def _poll_health(self) -> None:
+        interval_s = 0.1
+        timeout_s = 2.0
+        url = f"{self._base_api_url}/health"
+        while not self._stop_event.is_set():
+            try:
+                requests.get(url, timeout=timeout_s)
+                return
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                requests.RequestException,
+                TimeoutError,
+            ):
+                # Transient errors while the API process is still starting.
+                time.sleep(interval_s)
+                continue
+
+    def _get_migration_recv(self) -> None:
+        timeout_s = 2.0
+        url = f"{self._base_api_url}/shadow_migration/recv"
+        params = {"migration_id": self._handoff.migration_id}
+        try:
+            response = requests.get(url, params=params, timeout=timeout_s)
+            response.raise_for_status()
+            content = response.json()
+            self._kvstc_ipc_path = content["kvstc_ipc_path"]
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            requests.RequestException,
+            TimeoutError,
+        ):
+            logger.exception("shadow migration recv failed")
+
+    def _run_migration_session(self) -> None:
+        assert self._kvstc_ipc_path is not None
+        logger.info(
+            "Running migration session for migration_id=%s kvstc_ipc_path=%s",
+            self._handoff.migration_id,
+            self._kvstc_ipc_path,
+        )
+
+        sender = UdsMemfdKvstcSenderTransport()
+        self._kvstc_sender = sender
+        sender.connect(self._kvstc_ipc_path)
+
+        requests = self._kv_state.requests
+        new_handoff_requests = [
+            KvstcRequest(
+                request_id=request_id,
+                token_ids=self._kv_state.requests[request_id].prompt_token_ids
+                + self._kv_state.requests[request_id].output_token_ids,
+                block_table=self._kv_state.requests[request_id].block_table,
+            )
+            for request_id in requests
+        ]
+
+        handoff = KvstcHandoff(
+            migration_id=self._handoff.migration_id,
+            num_layers=self._handoff.num_layers,
+            batch_size=len(requests),
+            shadow_num_blocks=self._handoff.shadow_num_blocks,
+            num_kv_heads=self._handoff.num_kv_heads,
+            head_dim=self._handoff.head_dim,
+            block_size=self._handoff.block_size,
+            dtype=self._handoff.dtype,
+            requests=new_handoff_requests,
+        )
+        sender.send_handoff(handoff)
+        for layer_idx in range(handoff.num_layers):
+            tensor = self._kv_state.layers[layer_idx]
+            assert tensor is not None
+            sender.send_layer(tensor)
+        sender.close()
+        self._kvstc_sender = None
+        self._kvstc_ipc_path = None
+
+
 class ShadowEngine:
     """Engine to load model in parallel with KVHTS, then run ShadowExecutor.
 
@@ -195,6 +319,7 @@ class ShadowEngine:
         self,
         shadow_kvhts_ipc_prefix: str,
         shadow_config: ShadowConfig,
+        cold_base_api_url: str,
         *,
         shadow_http_host: str = "127.0.0.1",
         shadow_http_port: int = 8004,
@@ -203,6 +328,7 @@ class ShadowEngine:
             f"{shadow_kvhts_ipc_prefix}-{secrets.token_hex(8)}"
         )
         self._shadow_config: ShadowConfig = shadow_config
+        self._cold_base_api_url: str = cold_base_api_url
         self._shadow_http_host: str = shadow_http_host
         self._shadow_http_port: int = shadow_http_port
 
@@ -218,6 +344,7 @@ class ShadowEngine:
         )
         self._model_loader = _ModelLoader(shadow_config)
         self._executor: ShadowExecutor | None = None
+        self._kvstc_session: _KvstcSession | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -225,6 +352,8 @@ class ShadowEngine:
         self._migration_session.stop()
         if self._executor is not None:
             self._executor.stop()
+        if self._kvstc_session is not None:
+            self._kvstc_session.stop()
 
     def _shutdown_shadow_http(self) -> None:
         srv = self._http_server
@@ -268,10 +397,15 @@ class ShadowEngine:
                 model=model,
                 kv_state=kv_state,
             )
-            logger.info(
-                "Running shadow executor: migration_id=%s", handoff.migration_id
+            self._kvstc_session = _KvstcSession(
+                base_api_url=self._cold_base_api_url,
+                handoff=handoff,
+                kv_state=kv_state,
+                executor=self._executor,
             )
-            self._executor.run()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                executor.submit(self._executor.run)
+                executor.submit(self._kvstc_session.run)
         finally:
             self._teardown()
 
