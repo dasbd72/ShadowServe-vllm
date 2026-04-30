@@ -34,6 +34,7 @@ from vllm.config.parallel import EPLBConfig, ParallelConfig
 from vllm.config.pooler import PoolerConfig
 from vllm.config.profiler import ProfilerConfig
 from vllm.config.scheduler import SchedulerConfig
+from vllm.config.shadow_migration import ShadowMigrationConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.speech_to_text import SpeechToTextConfig
 from vllm.config.structured_outputs import StructuredOutputsConfig
@@ -103,6 +104,8 @@ __all__ = [
     "PoolerConfig",
     # From vllm.config.scheduler
     "SchedulerConfig",
+    # From vllm.config.shadow_migration
+    "ShadowMigrationConfig",
     # From vllm.config.speculative
     "SpeculativeConfig",
     # From vllm.config.speech_to_text
