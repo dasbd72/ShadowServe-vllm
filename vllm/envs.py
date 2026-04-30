@@ -124,6 +124,10 @@ if TYPE_CHECKING:
     K_SCALE_CONSTANT: int = 200
     V_SCALE_CONSTANT: int = 100
     VLLM_SERVER_DEV_MODE: bool = False
+    VLLM_SHADOW_SENDER_ENABLED: bool = False
+    VLLM_SHADOW_ADDITIONAL_BLOCKS_PER_REQUEST: int = 0
+    VLLM_SHADOW_TKSTH_IPC_PREFIX: str | None = None
+    VLLM_SHADOW_RECEIVER_ENABLED: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1038,6 +1042,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+    # Enable serverless shadow KV migration (hot GPU -> shadow CPU).
+    "VLLM_SHADOW_SENDER_ENABLED": lambda: os.environ.get(
+        "VLLM_SHADOW_SENDER_ENABLED", ""
+    )
+    .strip()
+    .lower()
+    in ("1", "true"),
+    # Extra shadow KV block slots reserved per migrated request.
+    "VLLM_SHADOW_ADDITIONAL_BLOCKS_PER_REQUEST": lambda: int(
+        os.environ.get("VLLM_SHADOW_ADDITIONAL_BLOCKS_PER_REQUEST", "0")
+    ),
+    # Hot-side TKSTH Unix socket path prefix (token deltas from shadow); empty disables.
+    "VLLM_SHADOW_TKSTH_IPC_PREFIX": lambda: (
+        None
+        if "VLLM_SHADOW_TKSTH_IPC_PREFIX" not in os.environ
+        else (os.environ["VLLM_SHADOW_TKSTH_IPC_PREFIX"].strip() or None)
+    ),
+    # Enable serverless shadow migration receiver (cold side).
+    "VLLM_SHADOW_RECEIVER_ENABLED": lambda: os.environ.get(
+        "VLLM_SHADOW_RECEIVER_ENABLED", ""
+    )
+    .strip()
+    .lower()
+    in ("1", "true"),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
     # V1 AsyncLLM interface. It is applicable when handling a high
@@ -1726,6 +1754,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
+        "VLLM_SHADOW_SENDER_ENABLED",
+        "VLLM_SHADOW_ADDITIONAL_BLOCKS_PER_REQUEST",
+        "VLLM_SHADOW_TKSTH_IPC_PREFIX",
+        "VLLM_SHADOW_RECEIVER_ENABLED",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_RANDOMIZE_DP_DUMMY_INPUTS",
