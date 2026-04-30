@@ -151,6 +151,10 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # Bounded history of recently finished requests for introspection.
+        self._finished_shadow_migration_infos: deque[dict[str, Any]] = deque(
+            maxlen=1024
+        )
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -1682,6 +1686,99 @@ class Scheduler(SchedulerInterface):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
+    def get_shadow_migration_request_infos(
+        self,
+        *,
+        include_finished: bool = True,
+        finished_limit: int = 1024,
+    ) -> dict[str, Any]:
+        active: list[dict[str, Any]] = []
+        for rid, req in self.requests.items():
+            if req.is_finished():
+                continue
+            active.append(
+                {
+                    "request_id": rid,
+                    "status": str(req.status),
+                    "arrival_time": req.arrival_time,
+                    "client_index": req.client_index,
+                    "num_prompt_tokens": req.num_prompt_tokens,
+                    "num_output_tokens": req.num_output_tokens,
+                    "num_tokens": req.num_tokens,
+                    "num_computed_tokens": req.num_computed_tokens,
+                    "num_preemptions": req.num_preemptions,
+                }
+            )
+        out: dict[str, Any] = {"active": active}
+        if include_finished:
+            finished = list(self._finished_shadow_migration_infos)[-finished_limit:]
+            out["finished"] = finished
+        return out
+
+    def detach_requests_for_shadow_migration(
+        self, request_ids: list[str]
+    ) -> list[Request]:
+        """Remove requests from scheduling queues; set ``MIGRATING_TO_SHADOW``.
+
+        Call immediately before the worker gathers KV, while GPU state is still
+        consistent with the last forward pass.
+        """
+        running_requests_to_remove: set[Request] = set()
+        requests_to_migrate: list[Request] = []
+        running_set = {r.request_id for r in self.running}
+        for rid in request_ids:
+            request = self.requests.get(rid)
+            if request is None:
+                raise ValueError(f"kvhts migration: unknown request_id {rid!r}")
+            if request.is_finished():
+                logger.warning("kvhts migration: request %r already finished", rid)
+                continue
+            if request.status != RequestStatus.RUNNING:
+                logger.warning(
+                    "kvhts migration: request %r must be RUNNING (got %s)",
+                    rid,
+                    request.status,
+                )
+                continue
+            if rid not in running_set:
+                raise ValueError(
+                    f"kvhts migration: request {rid!r} is RUNNING but "
+                    f"not in running list"
+                )
+            running_requests_to_remove.add(request)
+            requests_to_migrate.append(request)
+
+        if running_requests_to_remove:
+            self.running = remove_all(self.running, running_requests_to_remove)
+        for request in requests_to_migrate:
+            request.status = RequestStatus.MIGRATING_TO_SHADOW
+            self.prev_step_scheduled_req_ids.discard(request.request_id)
+        return requests_to_migrate
+
+    def promote_migrated_requests_to_shadow_running(
+        self, request_ids: list[str]
+    ) -> None:
+        """Free scheduler KV blocks after GPU migration.
+
+        The requests will be moved to the running queue and will continue to decode on
+        shadow until the shadow TKSTH session ends.
+        """
+        for rid in request_ids:
+            request = self.requests.get(rid)
+            if request is None:
+                raise ValueError(
+                    "promote_migrated_requests_to_shadow_running: unknown "
+                    f"request_id {rid!r}"
+                )
+            if request.status != RequestStatus.MIGRATING_TO_SHADOW:
+                raise ValueError(
+                    "promote_migrated_requests_to_shadow_running: request "
+                    f"{rid!r} must be MIGRATING_TO_SHADOW (got {request.status})"
+                )
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+            request.status = RequestStatus.RUNNING_ON_SHADOW
+
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[tuple[str, int]]:
@@ -1718,6 +1815,12 @@ class Scheduler(SchedulerInterface):
             valid_requests.append(request)
             if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
+            elif request.status == RequestStatus.MIGRATING_TO_SHADOW:
+                # Removed from queues by detach_requests_for_shadow_migration().
+                pass
+            elif request.status == RequestStatus.RUNNING_ON_SHADOW:
+                # Decode continues on shadow; not in running/waiting queues.
+                pass
             else:
                 if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
                     self.num_waiting_for_streaming_input -= 1
@@ -1749,9 +1852,25 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        # Record a compact finished-request summary before the request is deleted.
+        request_id = request.request_id
+        self._finished_shadow_migration_infos.append(
+            {
+                "request_id": request_id,
+                "status": str(request.status),
+                "client_index": request.client_index,
+                "arrival_time": request.arrival_time,
+                "num_prompt_tokens": request.num_prompt_tokens,
+                "num_output_tokens": request.num_output_tokens,
+                "num_tokens": request.num_tokens,
+                "num_computed_tokens": request.num_computed_tokens,
+                "num_preemptions": request.num_preemptions,
+                "stop_reason": request.stop_reason,
+            }
+        )
+
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
-        request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
