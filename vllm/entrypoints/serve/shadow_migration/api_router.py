@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import secrets
 import time
 from http import HTTPStatus
 
@@ -98,9 +99,62 @@ async def migrate_shadow_migration(
     )
 
 
+@router.get("/shadow_migration/recv")
+async def recv_shadow_migration(
+    raw_request: Request,
+    migration_id: int = Query(description="Migration ID to receive."),
+):
+    """Create a new KVSTC receiver session and starts accepting."""
+    client = engine_client(raw_request)
+    cfg = client.vllm_config.shadow_migration_config
+    if not cfg.shadow_receiver_enabled:
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN,
+            detail="Shadow migration is disabled (shadow_receiver_enabled / "
+            "--shadow-receiver-enabled).",
+        )
+    pfx = cfg.shadow_kvstc_ipc_prefix
+    if pfx is None or not str(pfx).strip():
+        raise RuntimeError(
+            "shadow migration requires shadow_kvstc_ipc_prefix "
+            "(--shadow-kvstc-ipc-prefix / VLLM_SHADOW_KVSTC_IPC_PREFIX)"
+        )
+    kvstc_ipc_path = f"{str(pfx).strip()}-{secrets.token_hex(8)}"
+    try:
+        await client.shadow_migration_recv(migration_id, kvstc_ipc_path)
+    except Exception as e:
+        logger.exception("shadow migration recv failed")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        ) from e
+    return JSONResponse(
+        content={"migration_id": migration_id, "kvstc_ipc_path": kvstc_ipc_path}
+    )
+
+
+@router.get("/shadow_migration/completed")
+async def list_completed_shadow_migration(
+    raw_request: Request,
+):
+    """List completed shadow migration sessions."""
+    client = engine_client(raw_request)
+    try:
+        completed = await client.shadow_migration_completed()
+    except Exception as e:
+        logger.exception("shadow migration completed failed")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        ) from e
+    return JSONResponse(content=completed)
+
+
 def attach_router(app: FastAPI):
     args = getattr(app.state, "args", None)
-    enabled = bool(getattr(args, "shadow_sender_enabled", False))
+    enabled = bool(getattr(args, "shadow_sender_enabled", False)) or bool(
+        getattr(args, "shadow_receiver_enabled", False)
+    )
     if not enabled:
         return
     logger.warning_once(

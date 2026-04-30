@@ -90,6 +90,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "then 200 with JSON ``kvhts_ipc_path``. Default: 8004."
         ),
     )
+    parser.add_argument(
+        "--cold-base-api-url",
+        default="http://127.0.0.1:8000",
+        help="Base API URL for the cold vllm instance. "
+        "Used to migrate the request state to the cold vllm instance.",
+    )
     return parser.parse_args(argv)
 
 
@@ -115,6 +121,7 @@ def main(argv: list[str] | None = None) -> None:
     shadow_cfg = _shadow_config_from_args(args)
     shadow_engine = ShadowEngine(
         shadow_kvhts_ipc_prefix=args.shadow_kvhts_ipc_prefix,
+        cold_base_api_url=args.cold_base_api_url,
         shadow_config=shadow_cfg,
         shadow_http_host=str(args.shadow_http_host),
         shadow_http_port=int(args.shadow_http_port),

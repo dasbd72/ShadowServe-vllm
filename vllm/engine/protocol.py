@@ -231,6 +231,18 @@ class EngineClient(ABC):
         """List requests for shadow migration orchestration."""
         raise NotImplementedError
 
+    async def shadow_migration_recv(
+        self,
+        migration_id: int,
+        kvstc_ipc_path: str,
+    ) -> None:
+        """Create a new KVSTC receiver session and starts accepting."""
+        raise NotImplementedError
+
+    async def shadow_migration_completed(self) -> dict[str, list[int]]:
+        """List completed shadow migration sessions."""
+        raise NotImplementedError
+
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks"""
         raise NotImplementedError

@@ -224,6 +224,14 @@ class ShadowKvState:
         for bid in block_table:
             self._free_blocks.discard(bid)
 
+    @property
+    def requests(self) -> dict[str, Request]:
+        return self._requests
+
+    @property
+    def layers(self) -> list[MemfdTensor | None]:
+        return self._layers
+
     def has_requests(self) -> bool:
         return bool(self._requests)
 
