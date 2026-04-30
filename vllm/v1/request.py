@@ -312,6 +312,8 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_REMOTE_KVS = enum.auto()
     WAITING_FOR_STREAMING_REQ = enum.auto()
     RUNNING = enum.auto()
+    MIGRATING_TO_SHADOW = enum.auto()
+    RUNNING_ON_SHADOW = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered
     # as a finished status.
@@ -321,6 +323,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_IGNORED = enum.auto()
     FINISHED_ERROR = enum.auto()
     FINISHED_REPETITION = enum.auto()
+    FINISHED_MIGRATED = enum.auto()
 
     def __str__(self) -> str:
         return self.name
@@ -346,4 +349,5 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
     RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,
     RequestStatus.FINISHED_REPETITION: FinishReason.REPETITION,
+    RequestStatus.FINISHED_MIGRATED: FinishReason.MIGRATED,
 }
