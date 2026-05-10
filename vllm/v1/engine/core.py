@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.shadow.transfer.kvstc_protocol import KvstcHandoff
 from vllm.shadow.transfer.tksth_protocol import (
     TksthError,
     TksthFinish,
@@ -62,6 +63,11 @@ from vllm.v1.engine import (
     ReconfigureRankType,
     UtilityOutput,
     UtilityResult,
+)
+from vllm.v1.engine.shadow_kvstc_session import (
+    KvstcLayerReceived,
+    KvstcSessionDone,
+    ShadowKvstcSession,
 )
 from vllm.v1.engine.shadow_tksth_session import (
     ShadowSessionDone,
@@ -209,12 +215,16 @@ class EngineCore:
         )
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
+        # Prefix-caching hash function used by block hashing and (future) KVSTC
+        # prefix-cache registration on the receiver side.
+        self._caching_hash_fn: Any | None = None
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
             init_none_hash(caching_hash_fn)
+            self._caching_hash_fn = caching_hash_fn
 
             self.request_block_hasher = get_request_block_hasher(
                 scheduler_block_size, caching_hash_fn
@@ -228,6 +238,8 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._shadow_tksth_sessions: list[ShadowTksthSession] = []
+        self._shadow_kvstc_sessions: list[ShadowKvstcSession] = []
+        self._completed_migration_ids: list[int] = []
 
         self._idle_state_callbacks: list[Callable] = []
 
@@ -530,6 +542,251 @@ class EngineCore:
         ]
         return results
 
+    def shadow_migration_recv(
+        self,
+        migration_id: int,
+        kvstc_ipc_path: str,
+    ) -> None:
+        """Create a new KVSTC receiver session and starts accepting."""
+        if not self.vllm_config.shadow_migration_config.shadow_receiver_enabled:
+            raise RuntimeError(
+                "kvstc receiver is disabled "
+                "(shadow_receiver_enabled / --shadow-receiver-enabled)"
+            )
+        if any(
+            session.migration_id == migration_id
+            for session in self._shadow_kvstc_sessions
+        ):
+            logger.warning(
+                "kvstc receiver: migration_id=%d already exists",
+                migration_id,
+            )
+            return
+        logger.info(
+            "kvstc receiver starting migration_id=%d path=%s",
+            migration_id,
+            kvstc_ipc_path,
+        )
+        session = ShadowKvstcSession(
+            migration_id=migration_id,
+            kvstc_ipc_path=kvstc_ipc_path,
+        )
+        self._shadow_kvstc_sessions.append(session)
+
+    def shadow_migration_completed(self) -> dict[str, list[int]]:
+        return {
+            "completed_kvstc_sessions": self._completed_migration_ids,
+        }
+
+    def _drain_shadow_kvstc_events(self) -> None:
+        """Drain KVSTC receiver events.
+
+        This is called from the main engine loop (single-threaded) to keep
+        session state and any future scheduler mutations serialized.
+        """
+        if not self._shadow_kvstc_sessions:
+            return
+
+        from vllm.v1.core.kv_cache_manager import KVCacheBlock, KVCacheManager
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            hash_block_tokens,
+            make_block_hash_with_group_id,
+        )
+
+        kv_cache_manager: KVCacheManager = (
+            self.scheduler.kv_cache_manager  # type: ignore
+        )
+        for session in self._shadow_kvstc_sessions:
+            for event in session.drain_events():
+                if isinstance(event, KvstcHandoff):
+                    block_pool = kv_cache_manager.block_pool
+                    allocated: dict[str, list[KVCacheBlock]] = {}
+                    allocated_flat: list[KVCacheBlock] = []
+                    try:
+                        block_size = int(event.block_size)
+                        for req in event.requests:
+                            # Only full token blocks are prefix-cacheable; do not
+                            # allocate GPU blocks for a trailing partial (shadow
+                            # may still list it in block_table / memfd batch).
+                            full_blocks = len(req.token_ids) // block_size
+                            if len(req.block_table) < full_blocks:
+                                raise ValueError(
+                                    "kvstc block_table shorter than full-token blocks: "
+                                    f"request_id={req.request_id!r} "
+                                    f"len(block_table)={len(req.block_table)} "
+                                    f"full_blocks={full_blocks}"
+                                )
+                            req_blocks: list[KVCacheBlock] = []
+                            if full_blocks > 0:
+                                req_blocks = block_pool.get_new_blocks(full_blocks)
+                            allocated[req.request_id] = req_blocks
+                            allocated_flat.extend(req_blocks)
+                        session.allocated_by_request = allocated
+                    except ValueError as e:
+                        # Insufficient capacity: abort the session and free
+                        # all blocks we allocated so far.
+                        block_pool.free_blocks(allocated_flat)
+                        logger.warning(
+                            "kvstc abort: %s path=%s migration_id=%d",
+                            e,
+                            session.kvstc_ipc_path,
+                            int(event.migration_id),
+                        )
+                        session.cancel()
+                        continue
+
+                elif isinstance(event, KvstcLayerReceived):
+                    handoff = session.handoff
+                    allocated_by_request = session.allocated_by_request
+                    pinned_kv = session.pinned_kv
+
+                    assert handoff is not None
+                    assert allocated_by_request
+                    assert pinned_kv is not None
+
+                    src_block_table_per_req: list[list[int]] = []
+                    dst_block_table_per_req: list[list[int]] = []
+                    num_blocks_per_req: list[int] = []
+                    for req in handoff.requests:
+                        req_id = req.request_id
+                        blocks = allocated_by_request.get(req_id)
+                        if blocks is None:
+                            raise RuntimeError(
+                                "kvstc layer received for unknown request_id "
+                                f"{req_id!r}"
+                            )
+                        n = len(blocks)
+                        src = list(req.block_table[:n])
+                        dst = [b.block_id for b in blocks]
+                        if len(req.block_table) < n:
+                            raise RuntimeError(
+                                "kvstc block_table shorter than allocated blocks for "
+                                f"{req_id!r}: len(block_table)={len(req.block_table)} "
+                                f"allocated={n}"
+                            )
+                        src_block_table_per_req.append(src)
+                        dst_block_table_per_req.append(dst)
+                        num_blocks_per_req.append(n)
+
+                    pinned_kv.copy_(event.tensor.tensor)
+
+                    try:
+                        # Scatter the KV layer into the GPU KV cache.
+                        self.collective_rpc(
+                            "shadow_kvstc_scatter",
+                            args=(
+                                int(event.layer_idx),
+                                session.pinned_kv,
+                                src_block_table_per_req,
+                                dst_block_table_per_req,
+                                num_blocks_per_req,
+                            ),
+                        )
+                    finally:
+                        # Close the memfd mapping as soon as the RPC returns.
+                        event.tensor.close()
+
+                elif isinstance(event, KvstcSessionDone) and event.error is not None:
+                    block_pool = kv_cache_manager.block_pool
+                    handoff = session.handoff
+                    allocated_by_request = session.allocated_by_request
+                    session.allocated_by_request = {}
+
+                    if allocated_by_request:
+                        block_pool.free_blocks(
+                            blk
+                            for blks in allocated_by_request.values()
+                            for blk in blks
+                        )
+                    migration_id = (
+                        int(handoff.migration_id) if handoff is not None else -1
+                    )
+                    logger.warning(
+                        "kvstc session failed; freed blocks without caching "
+                        "path=%s migration_id=%d error=%s",
+                        session.kvstc_ipc_path,
+                        migration_id,
+                        event.error,
+                    )
+
+                elif isinstance(event, KvstcSessionDone) and event.error is None:
+                    block_pool = kv_cache_manager.block_pool
+                    handoff = session.handoff
+                    allocated_by_request = session.allocated_by_request
+                    session.allocated_by_request = {}
+
+                    assert handoff is not None
+                    assert allocated_by_request
+
+                    if self._caching_hash_fn is None:
+                        raise RuntimeError(
+                            "kvstc registration requires prefix caching hash fn"
+                        )
+
+                    block_size = int(handoff.block_size)
+                    num_full_blocks_cached = 0
+                    for req in handoff.requests:
+                        req_id = req.request_id
+                        blocks = allocated_by_request.get(req_id)
+                        if blocks is None:
+                            raise RuntimeError(
+                                "kvstc session done missing allocated blocks for "
+                                f"request_id {req_id!r}"
+                            )
+
+                        token_ids = req.token_ids
+                        full_blocks = len(token_ids) // block_size
+                        if full_blocks <= 0:
+                            continue
+
+                        prev_hash: BlockHash | None = None
+                        for block_idx in range(full_blocks):
+                            start = block_idx * block_size
+                            end = start + block_size
+                            block_tokens = token_ids[start:end]
+                            block_hash = hash_block_tokens(
+                                self._caching_hash_fn,
+                                prev_hash,
+                                block_tokens,
+                                None,  # extra_keys=None for KVSTC chat scope
+                            )
+                            key = make_block_hash_with_group_id(block_hash, 0)
+                            blk = blocks[block_idx]
+                            blk.block_hash = key
+                            block_pool.cached_block_hash_to_block.insert(key, blk)
+                            prev_hash = block_hash
+                            num_full_blocks_cached += 1
+
+                    # Return refs to 0; cached full blocks stay in the hash map.
+                    blocks_to_free: list[KVCacheBlock] = []
+                    for req in handoff.requests:
+                        blocks = allocated_by_request.get(req.request_id)
+                        if not blocks:
+                            continue
+                        blocks_to_free.extend(blocks)
+                    block_pool.free_blocks(blocks_to_free)
+
+                    logger.info(
+                        "kvstc registered blocks migration_id=%d requests=%d "
+                        "full_blocks_cached=%d",
+                        int(handoff.migration_id),
+                        len(handoff.requests),
+                        num_full_blocks_cached,
+                    )
+
+                else:
+                    raise RuntimeError(
+                        f"unexpected kvstc event: {type(event).__name__}"
+                    )
+
+        self._completed_migration_ids.extend(
+            [s.migration_id for s in self._shadow_kvstc_sessions if s.is_done]
+        )
+        self._shadow_kvstc_sessions = [
+            s for s in self._shadow_kvstc_sessions if not s.is_done
+        ]
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -763,6 +1020,10 @@ class EngineCore:
             tksth_session.cancel()
             tksth_session.join(timeout=2.0)
         self._shadow_tksth_sessions.clear()
+        for session in self._shadow_kvstc_sessions:
+            session.cancel()
+            session.join(timeout=2.0)
+        self._shadow_kvstc_sessions.clear()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1334,6 +1595,7 @@ class EngineCoreProc(EngineCore):
             or self.scheduler.has_requests()
             or bool(self.batch_queue)
             or bool(self._shadow_tksth_sessions)
+            or bool(self._shadow_kvstc_sessions)
         )
 
     def run_busy_loop(self):
@@ -1392,11 +1654,16 @@ class EngineCoreProc(EngineCore):
         for shadow_output in self._drain_shadow_tksth_events():
             self.output_queue.put_nowait(shadow_output)
 
+        # Drain shadow KVSTC receiver events (single-threaded scheduler access).
+        self._drain_shadow_kvstc_events()
+
         # If no model execution happened but there are waiting requests
         # or active shadow sessions, yield the GIL briefly to allow
         # background threads to make progress.
         if not model_executed and (
-            self.scheduler.has_unfinished_requests() or self._shadow_tksth_sessions
+            self.scheduler.has_unfinished_requests()
+            or self._shadow_tksth_sessions
+            or self._shadow_kvstc_sessions
         ):
             time.sleep(0.001)
 

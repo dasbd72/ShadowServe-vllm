@@ -206,6 +206,16 @@ class EngineCoreClient(ABC):
     ) -> list[dict[str, int | str]]:
         raise NotImplementedError
 
+    def shadow_migration_recv(
+        self,
+        migration_id: int,
+        kvstc_ipc_path: str,
+    ) -> None:
+        raise NotImplementedError
+
+    def shadow_migration_completed(self) -> dict[str, list[int]]:
+        raise NotImplementedError
+
     def dp_engines_running(self) -> bool:
         """Returns True if data parallel engines are collectively in a
         running state."""
@@ -285,6 +295,16 @@ class EngineCoreClient(ABC):
         max_requests: int | None = None,
         additional_blocks_per_request: int = 0,
     ) -> list[dict[str, int | str]]:
+        raise NotImplementedError
+
+    async def shadow_migration_recv_async(
+        self,
+        migration_id: int,
+        kvstc_ipc_path: str,
+    ) -> None:
+        raise NotImplementedError
+
+    async def shadow_migration_completed_async(self) -> dict[str, list[int]]:
         raise NotImplementedError
 
 
@@ -392,6 +412,16 @@ class InprocClient(EngineCoreClient):
             max_requests,
             additional_blocks_per_request,
         )
+
+    def shadow_migration_recv(
+        self,
+        migration_id: int,
+        kvstc_ipc_path: str,
+    ) -> None:
+        return self.engine_core.shadow_migration_recv(migration_id, kvstc_ipc_path)
+
+    def shadow_migration_completed(self) -> dict[str, list[int]]:
+        return self.engine_core.shadow_migration_completed()
 
     def dp_engines_running(self) -> bool:
         return False
@@ -947,6 +977,16 @@ class SyncMPClient(MPClient):
             additional_blocks_per_request,
         )
 
+    def shadow_migration_recv(
+        self,
+        migration_id: int,
+        kvstc_ipc_path: str,
+    ) -> None:
+        return self.call_utility("shadow_migration_recv", migration_id, kvstc_ipc_path)
+
+    def shadow_migration_completed(self) -> dict[str, list[int]]:
+        return self.call_utility("shadow_migration_completed")
+
 
 class AsyncMPClient(MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
@@ -1213,6 +1253,18 @@ class AsyncMPClient(MPClient):
             max_requests,
             additional_blocks_per_request,
         )
+
+    async def shadow_migration_recv_async(
+        self,
+        migration_id: int,
+        kvstc_ipc_path: str,
+    ) -> None:
+        return await self.call_utility_async(
+            "shadow_migration_recv", migration_id, kvstc_ipc_path
+        )
+
+    async def shadow_migration_completed_async(self) -> dict[str, list[int]]:
+        return await self.call_utility_async("shadow_migration_completed")
 
 
 class DPAsyncMPClient(AsyncMPClient):
