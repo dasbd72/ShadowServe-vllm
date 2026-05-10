@@ -989,6 +989,28 @@ class Worker(WorkerBase):
             self.model_runner.num_prompt_logprobs.pop(req_id, None)
             self.model_runner.input_batch.remove_request(req_id)
 
+    def shadow_kvstc_scatter(
+        self,
+        layer_idx: int,
+        layer_tensor: torch.Tensor,
+        src_block_table_per_req: list[list[int]],
+        dst_block_table_per_req: list[list[int]],
+        num_blocks_per_req: list[int],
+    ) -> None:
+        """Scatter one received KV layer into the GPU KV cache."""
+        from vllm._custom_ops import scatter_kv_blocks_batched
+
+        kv_cache = self.model_runner.kv_caches[int(layer_idx)]
+        num_blocks_t = torch.tensor(num_blocks_per_req, dtype=torch.int32, device="cpu")
+        scatter_kv_blocks_batched(
+            kv_cache,
+            src_block_table_per_req,
+            layer_tensor,
+            dst_block_table_per_req,
+            num_blocks_t,
+        )
+        torch.cuda.synchronize()
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 
