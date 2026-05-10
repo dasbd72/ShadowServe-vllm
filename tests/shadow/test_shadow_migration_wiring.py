@@ -28,6 +28,16 @@ def shadow_app_enabled():
     return app
 
 
+@pytest.fixture
+def shadow_app_recv_enabled():
+    app = FastAPI()
+    app.state.args = SimpleNamespace(
+        shadow_receiver_enabled=True, shadow_sender_enabled=False
+    )
+    attach_router(app)
+    return app
+
+
 def test_shadow_migration_api_not_registered_when_disabled():
     app = FastAPI()
     app.state.args = SimpleNamespace(shadow_sender_enabled=False)
@@ -131,3 +141,26 @@ def test_shadow_migration_requests_endpoint_forbidden_when_disabled(shadow_app_e
     r = tc.get("/shadow_migration/requests")
     assert r.status_code == HTTPStatus.FORBIDDEN
     client.shadow_migration_get_requests.assert_not_called()
+
+
+def test_shadow_migration_recv_success_path(shadow_app_recv_enabled):
+    client = MagicMock()
+    cfg = SimpleNamespace(
+        shadow_receiver_enabled=True,
+        shadow_kvstc_ipc_prefix="/tmp/vllm-kvstc",
+    )
+    client.vllm_config = SimpleNamespace(shadow_migration_config=cfg)
+    client.shadow_migration_recv = AsyncMock()
+    shadow_app_recv_enabled.state.engine_client = client
+
+    tc = TestClient(shadow_app_recv_enabled)
+    r = tc.get("/shadow_migration/recv", params={"migration_id": 7})
+    assert r.status_code == HTTPStatus.OK
+    body = r.json()
+    assert body["migration_id"] == 7
+    assert "kvstc_ipc_path" in body
+    assert body["kvstc_ipc_path"].startswith("/tmp/vllm-kvstc-")
+    client.shadow_migration_recv.assert_called_once()
+    call_args = client.shadow_migration_recv.call_args[0]
+    assert call_args[0] == 7
+    assert call_args[1] == body["kvstc_ipc_path"]

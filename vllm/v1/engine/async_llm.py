@@ -968,6 +968,18 @@ class AsyncLLM(EngineClient):
             "shadow_migration_get_requests", include_finished, finished_limit
         )
 
+    async def shadow_migration_recv(
+        self,
+        migration_id: int,
+        kvstc_ipc_path: str,
+    ) -> None:
+        return await self.engine_core.call_utility_async(
+            "shadow_migration_recv", migration_id, kvstc_ipc_path
+        )
+
+    async def shadow_migration_completed(self) -> dict[str, list[int]]:
+        return await self.engine_core.call_utility_async("shadow_migration_completed")
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()
