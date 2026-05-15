@@ -164,3 +164,78 @@ def test_shadow_migration_recv_success_path(shadow_app_recv_enabled):
     call_args = client.shadow_migration_recv.call_args[0]
     assert call_args[0] == 7
     assert call_args[1] == body["kvstc_ipc_path"]
+
+
+@pytest.mark.asyncio
+async def test_async_mp_client_shadow_migration_async_delegation():
+    from vllm.v1.engine.core_client import AsyncMPClient
+
+    mock_util = AsyncMock(
+        side_effect=[
+            ["r1", "r2"],
+            {"active": {"r1": {}}, "finished": []},
+            None,
+            {7: [1, 2, 3]},
+        ]
+    )
+    client = object.__new__(AsyncMPClient)
+    client.call_utility_async = mock_util
+
+    migrated = await client.shadow_migration_migrate_async("/sock", 7, ["r1", "r2"])
+    assert migrated == ["r1", "r2"]
+    mock_util.assert_any_call("shadow_migration_migrate", "/sock", 7, ["r1", "r2"])
+
+    listed = await client.shadow_migration_get_requests_async(
+        include_finished=False, finished_limit=10
+    )
+    assert listed == {"active": {"r1": {}}, "finished": []}
+    mock_util.assert_any_call("shadow_migration_get_requests", False, 10)
+
+    await client.shadow_migration_recv_async(7, "/tmp/kvstc.sock")
+    mock_util.assert_any_call("shadow_migration_recv", 7, "/tmp/kvstc.sock")
+
+    completed = await client.shadow_migration_completed_async()
+    assert completed == {7: [1, 2, 3]}
+    mock_util.assert_any_call("shadow_migration_completed")
+
+
+def test_inproc_client_shadow_migration_delegation():
+    from vllm.v1.engine.core_client import InprocClient
+
+    client = object.__new__(InprocClient)
+    client.engine_core = MagicMock()
+    client.engine_core.shadow_migration_migrate.return_value = ["r1"]
+    client.engine_core.shadow_migration_get_requests.return_value = {"active": {}}
+    client.engine_core.shadow_migration_recv.return_value = None
+    client.engine_core.shadow_migration_completed.return_value = {1: [2]}
+
+    assert client.shadow_migration_migrate("/sock", 3, ["r1"]) == ["r1"]
+    client.engine_core.shadow_migration_migrate.assert_called_once_with(
+        "/sock", 3, ["r1"]
+    )
+
+    assert client.shadow_migration_get_requests(
+        include_finished=False, finished_limit=5
+    ) == {"active": {}}
+    client.engine_core.shadow_migration_get_requests.assert_called_once_with(False, 5)
+
+    assert client.shadow_migration_recv(9, "/kvstc") is None
+    client.engine_core.shadow_migration_recv.assert_called_once_with(9, "/kvstc")
+
+    assert client.shadow_migration_completed() == {1: [2]}
+    client.engine_core.shadow_migration_completed.assert_called_once()
+
+
+def test_sync_mp_client_shadow_migration_delegation():
+    from vllm.v1.engine.core_client import SyncMPClient
+
+    client = object.__new__(SyncMPClient)
+    client.call_utility = MagicMock(return_value={"active": {"r1": {}}})
+
+    payload = client.shadow_migration_get_requests(
+        include_finished=True, finished_limit=1024
+    )
+    assert payload == {"active": {"r1": {}}}
+    client.call_utility.assert_called_once_with(
+        "shadow_migration_get_requests", True, 1024
+    )

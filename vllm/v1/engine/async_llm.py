@@ -954,18 +954,15 @@ class AsyncLLM(EngineClient):
         migration_id: int,
         request_ids: list[str],
     ) -> list[str]:
-        return await self.engine_core.call_utility_async(
-            "shadow_migration_migrate",
-            kvhts_ipc_path,
-            migration_id,
-            request_ids,
+        return await self.engine_core.shadow_migration_migrate_async(
+            kvhts_ipc_path, migration_id, request_ids
         )
 
     async def shadow_migration_get_requests(
         self, *, include_finished: bool = True, finished_limit: int = 1024
     ) -> dict[str, Any]:
-        return await self.engine_core.call_utility_async(
-            "shadow_migration_get_requests", include_finished, finished_limit
+        return await self.engine_core.shadow_migration_get_requests_async(
+            include_finished=include_finished, finished_limit=finished_limit
         )
 
     async def shadow_migration_recv(
@@ -973,12 +970,12 @@ class AsyncLLM(EngineClient):
         migration_id: int,
         kvstc_ipc_path: str,
     ) -> None:
-        return await self.engine_core.call_utility_async(
-            "shadow_migration_recv", migration_id, kvstc_ipc_path
+        return await self.engine_core.shadow_migration_recv_async(
+            migration_id, kvstc_ipc_path
         )
 
     async def shadow_migration_completed(self) -> dict[str, list[int]]:
-        return await self.engine_core.call_utility_async("shadow_migration_completed")
+        return await self.engine_core.shadow_migration_completed_async()
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
