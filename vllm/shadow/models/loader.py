@@ -56,6 +56,9 @@ class ShadowModelLoader:
         """
         model = self._config.model
 
+        if self._config.load_format == "serverless_llm":
+            return os.path.normpath(os.path.expanduser(model))
+
         if os.path.isdir(model):
             logger.info("Using local model directory: %s", model)
             return model
@@ -131,6 +134,10 @@ class ShadowModelLoader:
         """
         load_format = self._config.load_format
 
+        if load_format == "serverless_llm":
+            yield from self._iter_sllm()
+            return
+
         if load_format != "safetensors":
             raise ValueError(
                 f"unsupported shadow load_format={load_format!r}; "
@@ -153,6 +160,51 @@ class ShadowModelLoader:
         raise FileNotFoundError(
             f"No safetensors or .bin/.pt weight files found in {model_dir}"
         )
+
+    def _iter_sllm(self) -> Generator[tuple[str, torch.Tensor], None, None]:
+        from sllm_store.torch import load_dict
+
+        model_id = self._sllm_store_model_id()
+        logger.info(
+            "SLLM load_dict model_id=%r (local dir=%s)", model_id, self.model_dir
+        )
+        state = load_dict(model_id, {"": "cpu"})
+        for name in list(state.keys()):
+            tensor = state.pop(name)
+            self._warn_dtype_mismatch(name, tensor.dtype)
+            yield name, tensor
+            del tensor
+        del state
+
+    @staticmethod
+    def _remove_storage_prefix(path: str, prefix: str) -> str:
+        path = os.path.normpath(path)
+        prefix = os.path.normpath(prefix)
+
+        if path == prefix:
+            return ""
+        if path.startswith(prefix + os.sep):
+            return path[len(prefix) :].lstrip(os.sep)
+        return path
+
+    def _sllm_store_model_id(self) -> str:
+        full = os.path.normpath(os.path.expanduser(self.model_dir))
+        if not os.path.isabs(full):
+            full = os.path.abspath(full)
+        full = os.path.join(full, "rank_0")
+        storage_path = os.getenv("STORAGE_PATH", "~/models")
+        storage_path = os.path.normpath(os.path.expanduser(storage_path))
+        rel = self._remove_storage_prefix(full, storage_path)
+        if not rel:
+            raise ValueError(
+                f"SLLM model directory {full!r} equals STORAGE_PATH {storage_path!r}; "
+                "cannot derive store model id."
+            )
+        if os.path.isabs(rel):
+            raise ValueError(
+                f"SLLM model directory {full!r} should be under {storage_path!r}."
+            )
+        return rel
 
     def _iter_safetensors(
         self,
