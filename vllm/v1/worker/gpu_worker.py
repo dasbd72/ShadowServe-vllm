@@ -1042,6 +1042,21 @@ class Worker(WorkerBase):
             max_size=max_size,
         )
 
+    def save_serverless_llm_state(
+        self,
+        path: str,
+        pattern: str | None = None,
+        max_size: int | None = None,
+    ) -> None:
+        from vllm.model_executor.model_loader import ServerlessLLMLoader
+
+        ServerlessLLMLoader.save_model(
+            self.model_runner.model,
+            path,
+            pattern=pattern,
+            max_size=max_size,
+        )
+
     def save_tensorized_model(self, tensorizer_config: "TensorizerConfig") -> None:
         TensorizerLoader.save_model(
             self.get_model(),
