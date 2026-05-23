@@ -42,7 +42,7 @@ class Linear(nn.Module):
         primitive_cache_size: int = _DEFAULT_ONEDNN_PRIMITIVE_CACHE_SIZE,
     ) -> None:
         super().__init__()
-        self.use_onednn = os.environ.get("USE_ONEDNN", "0") == "1"
+        self.use_onednn = os.environ.get("USE_ONEDNN", "0") in ("1", "true")
         self._primitive_cache_size = int(primitive_cache_size)
         self.register_buffer("weight", weight)
         if bias is not None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
 import os
 import queue
 import signal
@@ -37,7 +38,10 @@ from vllm.shadow.runtime.utils import (
     decode_msgpack_zmq_frames,
     make_zmq_socket,
 )
-from vllm.shadow.transfer.kv_transport_common import dtype_str_from_torch
+from vllm.shadow.transfer.kv_transport_common import (
+    MemfdTensor,
+    dtype_str_from_torch,
+)
 from vllm.shadow.transfer.kvstc_memfd import UdsMemfdKvstcSenderTransport
 from vllm.shadow.transfer.kvstc_protocol import KvstcHandoff, KvstcRequest
 from vllm.shadow.transfer.tksth_protocol import (
@@ -50,6 +54,10 @@ from vllm.shadow.transfer.tksth_uds import UdsTksthSenderTransport
 logger = logging.getLogger("vllm.shadow.runtime.core")
 
 ENGINE_CORE_IDENTITY = (0).to_bytes(2, "little")
+
+# JIT-compile CPU attention + sampling on startup (no live migration state).
+_WARMUP_STEPS = 10
+_WARMUP_PROMPT_LEN = 2
 
 
 class ShadowEngineCoreRequestType(enum.Enum):
@@ -189,10 +197,97 @@ class ShadowEngineCore:
         self._completed_migration_ids: list[int] = []
         self._execution_meta: ExecutionMeta | None = None
 
+        self._warmup_on_init()
+
     @classmethod
     def from_engine_args(cls, engine_args: ShadowEngineArgs) -> ShadowEngineCore:
         """Construct a core from parsed CLI/launcher arguments."""
         return cls(engine_args=engine_args)
+
+    @torch.inference_mode()
+    def _warmup_on_init(self) -> None:
+        """Run dummy forwards to JIT-compile CPU kernels before KVHTS traffic."""
+        model_cfg = self.engine_args.get_model_config()
+        block_size = model_cfg.block_size
+        dtype = model_cfg.dtype
+        assert isinstance(dtype, torch.dtype)
+        dtype_str = dtype_str_from_torch(dtype)
+
+        hf = self.model.hf
+        num_layers = int(hf.num_hidden_layers)
+        num_kv_heads = int(hf.num_key_value_heads)
+        head_dim = int(hf.head_dim)
+
+        total_tokens = _WARMUP_PROMPT_LEN + _WARMUP_STEPS
+        blocks_per_req = math.ceil(total_tokens / block_size)
+        shadow_num_blocks = blocks_per_req
+
+        kv_state = ShadowKvState(
+            num_layers=num_layers,
+            num_blocks=shadow_num_blocks,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            dtype=dtype_str,
+        )
+
+        layer_shape = (2, shadow_num_blocks, num_kv_heads, block_size, head_dim)
+        layer_tensors: list[MemfdTensor] = []
+        request_id = "_warmup_0"
+        try:
+            for layer_idx in range(num_layers):
+                layer_tensor = torch.zeros(layer_shape, dtype=dtype)
+                memfd = MemfdTensor.from_tensor(layer_tensor)
+                layer_tensors.append(memfd)
+                kv_state.register_layer(layer_idx, memfd)
+
+            warmup_sampling = ShadowSamplingParams(
+                temperature=0.9,
+                top_k=50,
+                top_p=0.9,
+                stop_token_ids=[],
+                max_tokens=total_tokens,
+            )
+            kv_state.add_request(
+                request_id=request_id,
+                prompt_token_ids=list(range(_WARMUP_PROMPT_LEN)),
+                output_token_ids=[],
+                num_computed_tokens=0,
+                block_table=list(range(blocks_per_req)),
+                sampling_params=warmup_sampling,
+            )
+
+            t0 = time.perf_counter()
+            for _ in range(_WARMUP_STEPS):
+                token_ids, _, sampling_params, allocated = kv_state.prepare_request(
+                    request_id
+                )
+                if not token_ids or not allocated:
+                    break
+                batch = kv_state.build_attention_batch(
+                    [request_id],
+                    [token_ids],
+                )
+                logits = self.model(batch)
+                meta = shadow_sampling_metadata(
+                    [sampling_params],
+                    vocab=logits.shape[-1],
+                    device=logits.device,
+                    generators={},
+                )
+                next_token = self.sampler(logits, meta).tolist()[0]
+                del meta
+                kv_state.advance_decoded_token(request_id, next_token)
+
+            logger.info(
+                "shadow engine warmup completed in %.3fs (%d steps)",
+                time.perf_counter() - t0,
+                _WARMUP_STEPS,
+            )
+        finally:
+            kv_state.remove_request(request_id)
+            for memfd in layer_tensors:
+                memfd.close()
 
     @torch.inference_mode()
     def step(self) -> ShadowEngineCoreOutputs | None:

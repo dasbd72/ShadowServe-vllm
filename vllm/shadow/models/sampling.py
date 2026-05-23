@@ -121,6 +121,7 @@ def shadow_sampling_metadata(
     )
 
 
+@torch.compile(dynamic=True)
 def _compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     probs = logits.softmax(dim=-1, dtype=torch.float32)
     q = torch.empty_like(probs)

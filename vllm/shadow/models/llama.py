@@ -533,7 +533,8 @@ def build_llama_for_causal_lm(
     logger.debug("Weights: %s", weights.keys())
     for name in list(weights.keys()):
         n = _strip_model_prefix(name)
-        w[n] = weights[name]
+        w[n] = torch.empty_like(weights[name], device=device, dtype=dtype)
+        w[n].copy_(weights[name])
         weights.pop(name)
     logger.info("Loaded weights.")
 
