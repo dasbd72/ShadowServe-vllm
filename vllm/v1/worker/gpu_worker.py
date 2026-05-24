@@ -4,11 +4,13 @@
 
 import gc
 import os
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
+import msgspec
 import numpy as np
 import torch
 import torch.nn as nn
@@ -52,6 +54,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
+from vllm.v1.request import Request
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
@@ -813,6 +816,178 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1, uniform_decode=True)
+
+    def shadow_kvhts_migrate(
+        self,
+        migration_id: int,
+        kvhts_ipc_path: str,
+        requests: list[Request],
+        tksth_ipc_path: str,
+    ) -> None:
+        """Gather KV layer-by-layer, send handoff + layers over ``kvhts_ipc_path``.
+
+        Removes migrated requests from the model runner persistent batch and cache.
+        """
+
+        from vllm._custom_ops import gather_kv_blocks_batched
+        from vllm.shadow.transfer.kv_transport_common import dtype_str_from_torch
+        from vllm.shadow.transfer.kvhts_memfd import (
+            MemfdTensor,
+            UdsMemfdKvhtsSenderTransport,
+        )
+        from vllm.shadow.transfer.kvhts_protocol import KvhtsHandoff, KvhtsRequest
+
+        if not requests:
+            return
+
+        kv_caches: list[torch.Tensor] = self.model_runner.kv_caches
+        if not kv_caches:
+            raise RuntimeError("kvhts migration requires a non-empty kv_caches list")
+
+        request_ids = [r.request_id for r in requests]
+        src_block_tables: list[list[int]] = []
+        num_blocks_per_req: list[int] = []
+
+        for req_id in request_ids:
+            req_state = self.model_runner.requests.get(req_id)
+            if req_state is None:
+                raise RuntimeError(
+                    f"kvhts migration: request {req_id!r} not in model runner cache"
+                )
+            gpu_blocks = list(req_state.block_ids[0])
+            if not gpu_blocks:
+                raise RuntimeError(
+                    f"kvhts migration: request {req_id!r} has no allocated KV blocks"
+                )
+            src_block_tables.append(gpu_blocks)
+            num_blocks_per_req.append(len(gpu_blocks))
+
+        smc = self.vllm_config.shadow_migration_config
+        additional_per_request = smc.shadow_additional_blocks_per_request
+        dst_block_tables: list[list[int]] = []
+        offset = 0
+        for n in num_blocks_per_req:
+            dst_block_tables.append(list(range(offset, offset + n)))
+            offset += n
+        shadow_num_blocks = offset + additional_per_request * len(num_blocks_per_req)
+
+        handoff_requests: list[KvhtsRequest] = []
+        for i, req in enumerate(requests):
+            req_id = req.request_id
+            sp = req.sampling_params
+            pp = req.pooling_params
+            if pp is not None:
+                raise NotImplementedError(
+                    "kvhts migration supports chat completions only; "
+                    f"request {req_id!r} has pooling_params set"
+                )
+            if sp is None:
+                raise NotImplementedError(
+                    "kvhts migration requires sampling_params; "
+                    f"request {req_id!r} has no sampling_params"
+                )
+            sampling_wire = msgspec.to_builtins(sp)
+            if not isinstance(sampling_wire, dict):
+                raise RuntimeError(
+                    f"kvhts migration: sampling_params must serialize to a dict "
+                    f"for {req_id!r}"
+                )
+            num_computed_tokens = int(req.num_tokens - 1)
+            if num_computed_tokens <= 0:
+                raise RuntimeError(
+                    f"kvhts migration: request {req_id!r} has no computed tokens "
+                    f"(num_tokens={req.num_tokens})"
+                )
+            handoff_requests.append(
+                KvhtsRequest(
+                    request_id=req_id,
+                    prompt_token_ids=(
+                        list(req.prompt_token_ids)
+                        if req.prompt_token_ids is not None
+                        else None
+                    ),
+                    output_token_ids=list(req.output_token_ids),
+                    num_computed_tokens=num_computed_tokens,
+                    block_table=dst_block_tables[i],
+                    sampling_params=sampling_wire,
+                )
+            )
+
+        if not str(tksth_ipc_path).strip():
+            raise ValueError("tksth_ipc_path must be a non-empty string")
+
+        kv0 = kv_caches[0]
+        _, _, block_size, num_kv_heads, head_dim = map(int, kv0.shape)
+        num_layers = len(kv_caches)
+        batch_size = len(request_ids)
+        handoff = KvhtsHandoff(
+            migration_id=int(migration_id),
+            num_layers=int(num_layers),
+            batch_size=int(batch_size),
+            shadow_num_blocks=int(shadow_num_blocks),
+            num_kv_heads=int(num_kv_heads),
+            head_dim=int(head_dim),
+            block_size=int(block_size),
+            dtype=dtype_str_from_torch(kv0.dtype),
+            requests=handoff_requests,
+            tksth_ipc_path=tksth_ipc_path,
+        )
+
+        num_blocks_t = torch.tensor(num_blocks_per_req, dtype=torch.int32, device="cpu")
+        pinned_kv = torch.empty(
+            2,
+            shadow_num_blocks,
+            num_kv_heads,
+            block_size,
+            head_dim,
+            dtype=kv0.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+        t0 = time.perf_counter()
+        transport = UdsMemfdKvhtsSenderTransport()
+        try:
+            transport.connect(kvhts_ipc_path)
+            transport.send_handoff(handoff)
+
+            for layer_idx, kv_cache in enumerate(kv_caches):
+                if kv_cache.shape != kv0.shape:
+                    raise NotImplementedError(
+                        "kvhts migration expects uniform KV shape per layer; "
+                        f"layer 0 {tuple(kv0.shape)} vs layer {layer_idx} "
+                        f"{tuple(kv_cache.shape)}"
+                    )
+                gather_kv_blocks_batched(
+                    kv_cache,
+                    src_block_tables,
+                    pinned_kv,
+                    dst_block_tables,
+                    num_blocks_t,
+                )
+                torch.cuda.synchronize()
+                transport.send_layer(MemfdTensor.from_tensor(pinned_kv))
+        finally:
+            transport.close()
+
+        elapsed = time.perf_counter() - t0
+        total_bytes = num_layers * pinned_kv.numel() * pinned_kv.element_size()
+        logger.info(
+            "kvhts migration batch done: migration_id=%s requests=%d "
+            "layers=%d shadow_blocks=%d bytes≈%d time_s=%.3f tksth_ipc_path=%s",
+            migration_id,
+            batch_size,
+            num_layers,
+            shadow_num_blocks,
+            total_bytes,
+            elapsed,
+            tksth_ipc_path,
+        )
+
+        for req_id in request_ids:
+            self.model_runner.requests.pop(req_id, None)
+            self.model_runner.num_prompt_logprobs.pop(req_id, None)
+            self.model_runner.input_batch.remove_request(req_id)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

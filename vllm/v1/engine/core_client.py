@@ -196,6 +196,14 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    def shadow_migration_migrate(
+        self,
+        migration_id: int,
+        kvhts_ipc_path: str,
+        max_requests: int | None = None,
+    ) -> list[dict[str, int | str]]:
+        raise NotImplementedError
+
     def dp_engines_running(self) -> bool:
         """Returns True if data parallel engines are collectively in a
         running state."""
@@ -265,6 +273,14 @@ class EngineCoreClient(ABC):
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
+        raise NotImplementedError
+
+    async def shadow_migration_migrate_async(
+        self,
+        migration_id: int,
+        kvhts_ipc_path: str,
+        max_requests: int | None = None,
+    ) -> list[dict[str, int | str]]:
         raise NotImplementedError
 
 
@@ -356,6 +372,16 @@ class InprocClient(EngineCoreClient):
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+
+    def shadow_migration_migrate(
+        self,
+        migration_id: int,
+        kvhts_ipc_path: str,
+        max_requests: int | None = None,
+    ) -> list[dict[str, int | str]]:
+        return self.engine_core.shadow_migration_migrate(
+            migration_id, kvhts_ipc_path, max_requests
+        )
 
     def dp_engines_running(self) -> bool:
         return False
@@ -894,6 +920,16 @@ class SyncMPClient(MPClient):
     ) -> None:
         self.call_utility("save_sharded_state", path, pattern, max_size)
 
+    def shadow_migration_migrate(
+        self,
+        migration_id: int,
+        kvhts_ipc_path: str,
+        max_requests: int | None = None,
+    ) -> list[dict[str, int | str]]:
+        return self.call_utility(
+            "shadow_migration_migrate", migration_id, kvhts_ipc_path, max_requests
+        )
+
 
 class AsyncMPClient(MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
@@ -1142,6 +1178,16 @@ class AsyncMPClient(MPClient):
     ) -> list[_R]:
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
+        )
+
+    async def shadow_migration_migrate_async(
+        self,
+        migration_id: int,
+        kvhts_ipc_path: str,
+        max_requests: int | None = None,
+    ) -> list[dict[str, int | str]]:
+        return await self.call_utility_async(
+            "shadow_migration_migrate", migration_id, kvhts_ipc_path, max_requests
         )
 
 
