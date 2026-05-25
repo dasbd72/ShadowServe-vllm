@@ -6,7 +6,6 @@ from __future__ import annotations
 import enum
 import logging
 import math
-import os
 import queue
 import signal
 import threading
@@ -30,6 +29,7 @@ from vllm.shadow.models.sampling import (
     stop_finish_reason,
 )
 from vllm.shadow.runtime.arg_utils import ShadowEngineArgs
+from vllm.shadow.runtime.cpu_threads import init_shadow_cpu_threads_env
 from vllm.shadow.runtime.shadow_kvhts_session import ShadowKvhtsSession
 from vllm.shadow.runtime.utils import (
     HANDSHAKE_TIMEOUT_MINS,
@@ -177,16 +177,7 @@ class ShadowEngineCore:
     """Shadow engine core that handles the model execution and KV state management."""
 
     def __init__(self, engine_args: ShadowEngineArgs):
-        omp_num_threads = os.environ.get("OMP_NUM_THREADS")
-        if omp_num_threads is not None:
-            logger.info("Setting torch threads to %d", int(omp_num_threads))
-            try:
-                torch.set_num_threads(int(omp_num_threads))
-            except ValueError:
-                logger.warning(
-                    "Ignoring invalid OMP_NUM_THREADS=%r for torch.set_num_threads",
-                    omp_num_threads,
-                )
+        self._init_cpu_threads()
 
         self.engine_args = engine_args
 
@@ -203,6 +194,12 @@ class ShadowEngineCore:
     def from_engine_args(cls, engine_args: ShadowEngineArgs) -> ShadowEngineCore:
         """Construct a core from parsed CLI/launcher arguments."""
         return cls(engine_args=engine_args)
+
+    def _init_cpu_threads(self) -> None:
+        t_init_cpu_threads = time.perf_counter()
+        init_shadow_cpu_threads_env()
+        t_init_cpu_threads = time.perf_counter() - t_init_cpu_threads
+        logger.info("cpu threads init completed in %.3fs", t_init_cpu_threads)
 
     @torch.inference_mode()
     def _warmup_on_init(self) -> None:
