@@ -7,9 +7,11 @@ import asyncio
 import logging
 import math
 import os
+import threading
 import time
 from contextlib import suppress
 
+import numpy as np
 import ray
 import torch
 
@@ -48,6 +50,114 @@ def _resolve_model(model: str, load_format: str, model_path: str | None) -> str:
         storage_path = os.getenv("STORAGE_PATH", os.path.expanduser("~/models"))
         return os.path.join(storage_path, "vllm", model)
     return model
+
+
+# Fixed DRAM working set (not the experiment knob). Large enough to miss LLC.
+_MEM_BW_WORKSET_BYTES = 512 * 1024 * 1024
+_MEM_BW_COPY_CHUNK_BYTES = 16 * 1024 * 1024
+
+
+class MemoryBandwidthWorkload:
+    """Synthetic DRAM copy load to verify cold-init interference without shadow.
+
+    ``num_threads`` (from ``--workload-cpus``) controls aggregate memory pressure.
+    """
+
+    def __init__(self, num_threads: int) -> None:
+        if num_threads <= 0:
+            raise ValueError(f"num_threads must be positive, got {num_threads}")
+
+        self.num_threads = num_threads
+
+        self._buffers: list[np.ndarray] = []
+        self._chunk_bytes = 0
+        self._stop = threading.Event()
+        self._workers_thread: threading.Thread | None = None
+        self._elapsed = 0.0
+        _configure_logging()
+
+    def init(self) -> None:
+        num_chunks = max(2, math.ceil(_MEM_BW_WORKSET_BYTES / _MEM_BW_COPY_CHUNK_BYTES))
+        self._chunk_bytes = math.ceil(_MEM_BW_WORKSET_BYTES / num_chunks)
+        self._buffers = [
+            np.empty(self._chunk_bytes, dtype=np.uint8) for _ in range(num_chunks)
+        ]
+        for buf in self._buffers:
+            buf.fill(1)
+        workset_gb = sum(buf.nbytes for buf in self._buffers) / (1024**3)
+        logger.info(
+            "MemoryBandwidthWorkload ready workset_gb=%.2f chunk_mb=%.0f threads=%d",
+            workset_gb,
+            self._chunk_bytes / (1024**2),
+            self.num_threads,
+        )
+
+    def start(self) -> None:
+        """Spawn copy threads and return (Ray actor stays free for ``stop()``)."""
+        if self._workers_thread is not None and self._workers_thread.is_alive():
+            raise RuntimeError("MemoryBandwidthWorkload already running")
+        if not self._buffers:
+            raise RuntimeError("call init() before start()")
+
+        self._stop.clear()
+        self._workers_thread = threading.Thread(
+            target=self._run_workers,
+            name="membw-workers",
+            daemon=True,
+        )
+        self._workers_thread.start()
+        logger.info("MemoryBandwidthWorkload.start")
+
+    def stop(self) -> float:
+        """Stop copy threads and return elapsed seconds since ``start()``."""
+        if self._workers_thread is None:
+            return self._elapsed
+
+        self._stop.set()
+        self._workers_thread.join()
+        self._workers_thread = None
+        logger.info("MemoryBandwidthWorkload.stop %.3fs", self._elapsed)
+        return self._elapsed
+
+    def _run_workers(self) -> None:
+        bytes_moved = 0
+        bytes_lock = threading.Lock()
+
+        def worker(tid: int) -> None:
+            nonlocal bytes_moved
+            n_bufs = len(self._buffers)
+            i = tid % n_bufs
+            local_bytes = 0
+            while not self._stop.is_set():
+                src = self._buffers[i % n_bufs]
+                dst = self._buffers[(i + 1) % n_bufs]
+                np.copyto(dst, src)
+                local_bytes += self._chunk_bytes
+                i += 1
+            with bytes_lock:
+                bytes_moved += local_bytes
+
+        t0 = time.perf_counter()
+        threads = [
+            threading.Thread(target=worker, args=(tid,), name=f"membw-{tid}")
+            for tid in range(self.num_threads)
+        ]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self._elapsed = time.perf_counter() - t0
+        achieved_gibps = (
+            (bytes_moved / self._elapsed) / (1024**3) if self._elapsed > 0 else 0.0
+        )
+        logger.info(
+            "MemoryBandwidthWorkload finished %.3fs achieved_gibps=%.2f "
+            "moved_gib=%.2f threads=%d",
+            self._elapsed,
+            achieved_gibps,
+            bytes_moved / (1024**3),
+            self.num_threads,
+        )
 
 
 class CpuWorkload:
@@ -243,19 +353,20 @@ class Context:
         model: str,
         load_format: str,
         model_path: str | None,
-        shadow_cpus: int,
+        workload_cpus: int,
         num_requests: int,
         input_len: int,
     ) -> None:
         self.model = model
         self.load_format = load_format
         self.model_path = model_path
-        self.shadow_cpus = shadow_cpus
+        self.workload_cpus = workload_cpus
         self.num_requests = num_requests
         self.input_len = input_len
 
         self.cold_actor = None
         self.cpu_workload_actor = None
+        self.mem_bw_actor = None
 
     async def start_cold(self) -> None:
         ray.remote(VllmBackend).options(
@@ -270,7 +381,7 @@ class Context:
     async def start_cpu_workload(self) -> None:
         ray.remote(CpuWorkload).options(
             name="cpu_workload",
-            num_cpus=self.shadow_cpus,
+            num_cpus=self.workload_cpus,
             lifetime="detached",
         ).remote(
             self.model,
@@ -282,6 +393,15 @@ class Context:
         self.cpu_workload_actor = ray.get_actor("cpu_workload")
         await self.cpu_workload_actor.init.remote()
 
+    async def start_mem_bw_workload(self) -> None:
+        ray.remote(MemoryBandwidthWorkload).options(
+            name="mem_bw_workload",
+            num_cpus=self.workload_cpus,
+            lifetime="detached",
+        ).remote(self.workload_cpus)
+        self.mem_bw_actor = ray.get_actor("mem_bw_workload")
+        await self.mem_bw_actor.init.remote()
+
     async def shutdown(self) -> None:
         if self.cold_actor is not None:
             await self.cold_actor.shutdown.remote()
@@ -289,6 +409,9 @@ class Context:
         if self.cpu_workload_actor is not None:
             await self.cpu_workload_actor.shutdown.remote()
             self.cpu_workload_actor = None
+        if self.mem_bw_actor is not None:
+            await self.mem_bw_actor.stop.remote()
+            self.mem_bw_actor = None
 
 
 async def run_baseline(context: Context) -> None:
@@ -313,6 +436,19 @@ async def run_concurrent(context: Context) -> None:
         await context.shutdown()
 
 
+async def run_mem_bw(context: Context) -> None:
+    """Cold init_backend while a synthetic DRAM copy workload runs."""
+    try:
+        await context.start_mem_bw_workload()
+
+        await context.mem_bw_actor.start.remote()
+        await context.start_cold()
+        mem_bw_s = await context.mem_bw_actor.stop.remote()
+        logger.info("mem_bw workload during cold init %.3fs", mem_bw_s)
+    finally:
+        await context.shutdown()
+
+
 async def main_async(args: argparse.Namespace) -> None:
     _configure_logging()
 
@@ -328,15 +464,17 @@ async def main_async(args: argparse.Namespace) -> None:
             args.model,
             args.load_format,
             args.model_path,
-            args.shadow_cpus,
+            args.workload_cpus,
             args.num_requests,
             args.input_len,
         )
 
-        if args.mode in ("baseline", "both"):
+        if args.mode == "baseline":
             await run_baseline(context)
-        if args.mode in ("concurrent", "both"):
+        elif args.mode == "concurrent":
             await run_concurrent(context)
+        elif args.mode == "mem_bw":
+            await run_mem_bw(context)
     finally:
         ray.shutdown()
 
@@ -345,9 +483,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--mode",
-        choices=("baseline", "concurrent", "both"),
-        default="both",
-        help="baseline=cold init only; concurrent=overlap with KVHTS",
+        choices=("baseline", "concurrent", "mem_bw"),
+        default="concurrent",
+        help=(
+            "baseline=cold init only; concurrent=overlap shadow KVHTS; "
+            "mem_bw=overlap synthetic DRAM copies"
+        ),
     )
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument(
@@ -360,7 +501,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override model directory (default: $STORAGE_PATH/vllm/<model>)",
     )
-    p.add_argument("--shadow-cpus", type=int, default=64)
+    p.add_argument(
+        "--workload-cpus",
+        type=int,
+        default=64,
+        help="Ray CPU allocation and mem_bw copy thread count",
+    )
     p.add_argument("--num-requests", type=int, default=4)
     p.add_argument(
         "--input-len",
