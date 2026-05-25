@@ -24,28 +24,24 @@ run_one cold_start_baseline_qwen3-0.6b.log \
 run_one cold_start_baseline_qwen3-8b.log \
   --mode baseline --model Qwen/Qwen3-8B
 
-run_one cold_start_concurrent_qwen3-0.6b_cpus16.log \
-  --mode concurrent --shadow-cpus 16 --model Qwen/Qwen3-0.6B --num-requests 4 --input-len 1024
+for cpus in 8 16 32 64 128; do
+  run_one "cold_start_concurrent_qwen3-0.6b_cpus${cpus}.log" \
+    --mode concurrent --workload-cpus "$cpus" --model Qwen/Qwen3-0.6B --num-requests 4 --input-len 1024
+done
 
-run_one cold_start_concurrent_qwen3-0.6b_cpus32.log \
-  --mode concurrent --shadow-cpus 32 --model Qwen/Qwen3-0.6B --num-requests 4 --input-len 1024
+for cpus in 8 16 32 64 128; do
+  run_one "cold_start_concurrent_qwen3-8b_cpus${cpus}.log" \
+    --mode concurrent --workload-cpus "$cpus" --model Qwen/Qwen3-8B --num-requests 4 --input-len 1024
+done
 
-run_one cold_start_concurrent_qwen3-0.6b_cpus64.log \
-  --mode concurrent --shadow-cpus 64 --model Qwen/Qwen3-0.6B --num-requests 4 --input-len 1024
+for cpus in 1 2 4 8 16 32; do
+  run_one "cold_start_mem_bw_qwen3-0.6b_cpus${cpus}.log" \
+    --mode mem_bw --workload-cpus "$cpus" --model Qwen/Qwen3-0.6B
+done
 
-run_one cold_start_concurrent_qwen3-0.6b_cpus128.log \
-  --mode concurrent --shadow-cpus 128 --model Qwen/Qwen3-0.6B --num-requests 4 --input-len 1024
-
-run_one cold_start_concurrent_qwen3-8b_cpus16.log \
-  --mode concurrent --shadow-cpus 16 --model Qwen/Qwen3-8B --num-requests 4 --input-len 1024
-
-run_one cold_start_concurrent_qwen3-8b_cpus32.log \
-  --mode concurrent --shadow-cpus 32 --model Qwen/Qwen3-8B --num-requests 4 --input-len 1024
-
-run_one cold_start_concurrent_qwen3-8b_cpus64.log \
-  --mode concurrent --shadow-cpus 64 --model Qwen/Qwen3-8B --num-requests 4 --input-len 1024
-
-run_one cold_start_concurrent_qwen3-8b_cpus128.log \
-  --mode concurrent --shadow-cpus 128 --model Qwen/Qwen3-8B --num-requests 4 --input-len 1024
+for cpus in 1 2 4 8 16 32; do
+  run_one "cold_start_mem_bw_qwen3-8b_cpus${cpus}.log" \
+    --mode mem_bw --workload-cpus "$cpus" --model Qwen/Qwen3-8B
+done
 
 echo "All runs complete. Logs in ${ROOT}/logs/"
