@@ -54,6 +54,7 @@ from vllm.config import (
     PrefetchOffloadConfig,
     ProfilerConfig,
     SchedulerConfig,
+    ShadowMigrationConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
     UVAOffloadConfig,
@@ -608,6 +609,13 @@ class EngineArgs:
     weight_transfer_config: WeightTransferConfig | None = get_field(
         VllmConfig,
         "weight_transfer_config",
+    )
+
+    shadow_sender_enabled: bool = get_field(
+        ShadowMigrationConfig, "shadow_sender_enabled"
+    )
+    shadow_receiver_enabled: bool = get_field(
+        ShadowMigrationConfig, "shadow_receiver_enabled"
     )
 
     fail_on_environ_validation: bool = False
@@ -1279,6 +1287,20 @@ class EngineArgs:
             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
         )
 
+        shadow_kwargs = get_kwargs(ShadowMigrationConfig)
+        shadow_group = parser.add_argument_group(
+            title="ShadowMigrationConfig",
+            description=ShadowMigrationConfig.__doc__,
+        )
+        shadow_group.add_argument(
+            "--shadow-sender-enabled",
+            **shadow_kwargs["shadow_sender_enabled"],
+        )
+        shadow_group.add_argument(
+            "--shadow-receiver-enabled",
+            **shadow_kwargs["shadow_receiver_enabled"],
+        )
+
         # Other arguments
         parser.add_argument(
             "--disable-log-stats",
@@ -1887,6 +1909,18 @@ class EngineArgs:
             ),
         )
 
+        shadow_migration_config = ShadowMigrationConfig(
+            shadow_sender_enabled=self.shadow_sender_enabled,
+            shadow_receiver_enabled=self.shadow_receiver_enabled,
+        )
+        if (
+            shadow_migration_config.shadow_receiver_enabled
+            and not self.enable_prefix_caching
+        ):
+            raise ValueError(
+                "shadow_receiver_enabled requires enable_prefix_caching to be True"
+            )
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1910,6 +1944,7 @@ class EngineArgs:
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
+            shadow_migration_config=shadow_migration_config,
         )
 
         return config
