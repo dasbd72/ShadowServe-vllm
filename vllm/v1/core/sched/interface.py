@@ -239,5 +239,22 @@ class SchedulerInterface(ABC):
         """Shutdown the scheduler."""
         raise NotImplementedError
 
+    @abstractmethod
+    def get_running_requests(self) -> list["Request"]:
+        """Return RUNNING requests."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def detach_requests_for_shadow_migration(
+        self, request_ids: list[str]
+    ) -> list["Request"]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def promote_migrated_requests_to_shadow_running(
+        self, request_ids: list[str]
+    ) -> None:
+        raise NotImplementedError
+
     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":
         return None

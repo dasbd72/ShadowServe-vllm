@@ -74,8 +74,10 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        external_req_id: str | None = None,
     ) -> None:
         self.request_id = request_id
+        self.external_req_id = external_req_id
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -210,6 +212,7 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            external_req_id=request.external_req_id,
         )
 
     def append_output_token_ids(
@@ -312,6 +315,8 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_REMOTE_KVS = enum.auto()
     WAITING_FOR_STREAMING_REQ = enum.auto()
     RUNNING = enum.auto()
+    MIGRATING_TO_SHADOW = enum.auto()
+    RUNNING_ON_SHADOW = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered
     # as a finished status.
@@ -321,6 +326,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_IGNORED = enum.auto()
     FINISHED_ERROR = enum.auto()
     FINISHED_REPETITION = enum.auto()
+    FINISHED_MIGRATED = enum.auto()
 
     def __str__(self) -> str:
         return self.name
@@ -346,4 +352,5 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
     RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,
     RequestStatus.FINISHED_REPETITION: FinishReason.REPETITION,
+    RequestStatus.FINISHED_MIGRATED: FinishReason.MIGRATED,
 }
