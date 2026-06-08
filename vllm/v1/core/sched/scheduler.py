@@ -775,6 +775,24 @@ class Scheduler(SchedulerInterface):
                     )
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    if num_computed_tokens > 0:
+                        total_tokens = request.num_tokens
+                        kv_reuse_pct = (
+                            num_computed_tokens / total_tokens * 100.0
+                            if total_tokens > 0
+                            else 0.0
+                        )
+                        logger.info(
+                            "New request %s prefix cache hit: "
+                            "local=%d external=%d reused=%d/%d tokens "
+                            "(%.1f%% KV reused)",
+                            request_id,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                            num_computed_tokens,
+                            total_tokens,
+                            kv_reuse_pct,
+                        )
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
