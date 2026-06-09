@@ -362,6 +362,7 @@ class EngineCore:
                 "kvhts migration is disabled "
                 "(shadow_sender_enabled / --shadow-sender-enabled)"
             )
+        self._flush_pending_model_outputs()
         if any(
             session.migration_id == migration_id
             for session in self._shadow_tksth_sessions
@@ -732,6 +733,20 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+    def _flush_pending_model_outputs(self) -> None:
+        """Apply in-flight async model outputs so scheduler state is current."""
+        batch_queue = self.batch_queue
+        if batch_queue is None:
+            return
+        while batch_queue:
+            future, scheduler_output, exec_model_fut = batch_queue.pop()
+            model_output = future.result()
+            if model_output is None:
+                exec_model_fut.result()
+                raise RuntimeError("unexpected error during output flush")
+            self._process_aborts_queue()
+            self.scheduler.update_from_output(scheduler_output, model_output)
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():

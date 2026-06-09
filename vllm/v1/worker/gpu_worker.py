@@ -873,6 +873,8 @@ class Worker(WorkerBase):
         )
 
         handoff_requests: list[KvhtsRequest] = []
+        pending_output_req_ids: list[str] = []
+        resolved_output_token_ids: dict[str, list[int]] = {}
         for i, req in enumerate(requests):
             req_id = req.request_id
             sp = req.sampling_params
@@ -887,13 +889,39 @@ class Worker(WorkerBase):
                     "kvhts migration requires sampling_params; "
                     f"request {req_id!r} has no sampling_params"
                 )
+            output_token_ids = list(req.output_token_ids)
+            expected_output_len = max(
+                0, req.num_computed_tokens - req.num_prompt_tokens + 1
+            )
+            missing = expected_output_len - len(output_token_ids)
+            if missing > 1:
+                raise RuntimeError(
+                    f"kvhts migration: request {req_id!r} has {missing} "
+                    "pending output tokens after flush; retry migration"
+                )
+            if missing == 1:
+                pending_output_req_ids.append(req_id)
+            resolved_output_token_ids[req_id] = output_token_ids
+
+        if pending_output_req_ids:
+            pending_tokens = self.model_runner.sync_pending_output_token_ids_batch(
+                pending_output_req_ids
+            )
+            for req_id, token_ids in pending_tokens.items():
+                resolved_output_token_ids[req_id].extend(token_ids)
+
+        for i, req in enumerate(requests):
+            req_id = req.request_id
+            sp = req.sampling_params
             sampling_wire = msgspec.to_builtins(sp)
             if not isinstance(sampling_wire, dict):
                 raise RuntimeError(
                     f"kvhts migration: sampling_params must serialize to a dict "
                     f"for {req_id!r}"
                 )
-            num_computed_tokens = int(req.num_tokens - 1)
+            num_computed_tokens = (
+                req.num_prompt_tokens + len(resolved_output_token_ids[req_id]) - 1
+            )
             if num_computed_tokens <= 0:
                 raise RuntimeError(
                     f"kvhts migration: request {req_id!r} has no computed tokens "
@@ -907,7 +935,7 @@ class Worker(WorkerBase):
                         if req.prompt_token_ids is not None
                         else None
                     ),
-                    output_token_ids=list(req.output_token_ids),
+                    output_token_ids=resolved_output_token_ids[req_id],
                     num_computed_tokens=num_computed_tokens,
                     block_table=dst_block_tables[i],
                     sampling_params=sampling_wire,

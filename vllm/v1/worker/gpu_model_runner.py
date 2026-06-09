@@ -4016,6 +4016,45 @@ class GPUModelRunner(
         self.draft_token_ids_event.synchronize()
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
 
+    def sync_pending_output_token_ids_batch(
+        self, req_ids: list[str]
+    ) -> dict[str, list[int]]:
+        """Sync the latest GPU-sampled token id(s) for migration handoff.
+
+        Used when async scheduling has not yet propagated sampled tokens to
+        the scheduler. Performs at most one GPU sync for the whole batch.
+        """
+        if not req_ids:
+            return {}
+
+        input_batch = self.input_batch
+        req_indices: list[int] = []
+        for req_id in req_ids:
+            req_index = input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                raise RuntimeError(
+                    "sync_pending_output_token_ids_batch: request "
+                    f"{req_id!r} not in persistent batch"
+                )
+            req_indices.append(req_index)
+
+        cpu_tokens = input_batch.sampled_token_ids_cpu
+        event = input_batch.async_copy_ready_event
+        if cpu_tokens is not None and event is not None:
+            if not event.query():
+                event.synchronize()
+            tokens = cpu_tokens[req_indices, 0].tolist()
+        else:
+            prev = input_batch.prev_sampled_token_ids
+            if prev is None:
+                raise RuntimeError(
+                    "sync_pending_output_token_ids_batch: no GPU sampled "
+                    f"tokens available for {req_ids!r}"
+                )
+            tokens = prev[req_indices, 0].cpu().tolist()
+
+        return {req_id: [int(token)] for req_id, token in zip(req_ids, tokens)}
+
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
