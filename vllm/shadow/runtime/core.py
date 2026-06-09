@@ -11,6 +11,7 @@ import signal
 import threading
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
@@ -29,7 +30,10 @@ from vllm.shadow.models.sampling import (
     stop_finish_reason,
 )
 from vllm.shadow.runtime.arg_utils import ShadowEngineArgs
-from vllm.shadow.runtime.cpu_threads import init_shadow_cpu_threads_env
+from vllm.shadow.runtime.cpu_threads import (
+    init_shadow_cpu_threads_env,
+    set_default_torch_num_threads,
+)
 from vllm.shadow.runtime.shadow_kvhts_session import ShadowKvhtsSession
 from vllm.shadow.runtime.utils import (
     HANDSHAKE_TIMEOUT_MINS,
@@ -186,7 +190,8 @@ class ShadowEngineCore:
 
         self._shadow_kvhts_sessions: list[ShadowKvhtsSession] = []
         self._completed_migration_ids: list[int] = []
-        self._execution_meta: ExecutionMeta | None = None
+        self._execution_metas: dict[int, ExecutionMeta] = {}
+        self._engine_num_threads: int = 1
 
         self._warmup_on_init()
 
@@ -198,8 +203,22 @@ class ShadowEngineCore:
     def _init_cpu_threads(self) -> None:
         t_init_cpu_threads = time.perf_counter()
         init_shadow_cpu_threads_env()
+        self._engine_num_threads = max(1, torch.get_num_threads())
         t_init_cpu_threads = time.perf_counter() - t_init_cpu_threads
-        logger.info("cpu threads init completed in %.3fs", t_init_cpu_threads)
+        logger.info(
+            "cpu threads init completed in %.3fs (engine_threads=%d)",
+            t_init_cpu_threads,
+            self._engine_num_threads,
+        )
+
+    def _threads_per_active_session(self, n_active: int) -> int:
+        """Fair-share of engine threads across concurrent runnable sessions."""
+        assert n_active >= 1
+        fair_share = max(1, self._engine_num_threads // n_active)
+        cap = self.engine_args.max_threads_per_session
+        if cap is not None:
+            return min(cap, fair_share)
+        return fair_share
 
     @torch.inference_mode()
     def _warmup_on_init(self) -> None:
@@ -287,11 +306,11 @@ class ShadowEngineCore:
                 memfd.close()
 
     @torch.inference_mode()
-    def step(self) -> ShadowEngineCoreOutputs | None:
-        if not self._execution_meta or self._execution_meta.waiting_for_migration:
+    def _step_session(self, meta: ExecutionMeta) -> ShadowEngineCoreOutputs | None:
+        if meta.waiting_for_migration:
             return None
 
-        kv_state = self._execution_meta.kv_state
+        kv_state = meta.kv_state
 
         t_preprocess = time.perf_counter()
         errors: list[ShadowEngineCoreOutput] = []
@@ -311,8 +330,11 @@ class ShadowEngineCore:
                 )
                 continue
             if not alloc:
-                self._execution_meta.waiting_for_migration = True
-                logger.warning("no free KV slots left for block table extension.")
+                meta.waiting_for_migration = True
+                logger.warning(
+                    "migration_id=%d: no free KV slots left for block table extension.",
+                    meta.migration_id,
+                )
                 break
             request_ids.append(rid)
             query_token_ids.append(tids)
@@ -320,10 +342,12 @@ class ShadowEngineCore:
             sampling_params.append(sp)
 
         if not request_ids:
+            if not errors:
+                return None
             return ShadowEngineCoreOutputs(
                 outputs=errors,
                 request_ids=request_ids,
-                kv_cache_usage=0.0,
+                kv_cache_usage=kv_state.kv_cache_usage(),
                 num_generation_tokens=0,
                 preprocess_elapsed=0.0,
                 forward_elapsed=0.0,
@@ -342,13 +366,13 @@ class ShadowEngineCore:
 
         t_postprocess = time.perf_counter()
         outputs: list[ShadowEngineCoreOutput] = []
-        meta = shadow_sampling_metadata(
+        sample_meta = shadow_sampling_metadata(
             sampling_params,
             vocab=logits.shape[-1],
             device=logits.device,
             generators={},
         )
-        step_output_token_ids = self.sampler(logits, meta).tolist()
+        step_output_token_ids = self.sampler(logits, sample_meta).tolist()
         for row_idx, rid in enumerate(request_ids):
             qtids = query_token_ids[row_idx]
             nc = num_computed[row_idx]
@@ -378,6 +402,78 @@ class ShadowEngineCore:
             postprocess_elapsed=postprocess_elapsed,
         )
 
+    @torch.inference_mode()
+    def step(self) -> ShadowEngineCoreOutputs | None:
+        runnable = [
+            meta
+            for meta in self._execution_metas.values()
+            if not meta.waiting_for_migration
+        ]
+        if not runnable:
+            return None
+
+        threads_per_session = self._threads_per_active_session(len(runnable))
+        merged_outputs: list[ShadowEngineCoreOutput] = []
+        merged_request_ids: list[str] = []
+        kv_cache_usages: list[float] = []
+        num_generation_tokens = 0
+        preprocess_elapsed = 0.0
+        forward_elapsed = 0.0
+        postprocess_elapsed = 0.0
+
+        # torch.set_num_threads is process-global; set once so concurrent session
+        # workers each use the same per-session OMP budget.
+        with (
+            set_default_torch_num_threads(threads_per_session),
+            ThreadPoolExecutor(
+                max_workers=len(runnable),
+                thread_name_prefix="vllm-shadow-session",
+            ) as executor,
+        ):
+            future_to_meta = {
+                executor.submit(self._step_session, meta): meta for meta in runnable
+            }
+            for future in as_completed(future_to_meta):
+                meta = future_to_meta[future]
+                try:
+                    session_outputs = future.result()
+                except Exception:
+                    logger.exception(
+                        "session step failed migration_id=%d",
+                        meta.migration_id,
+                    )
+                    continue
+                if session_outputs is None:
+                    continue
+                merged_outputs.extend(session_outputs.outputs)
+                merged_request_ids.extend(session_outputs.request_ids)
+                kv_cache_usages.append(session_outputs.kv_cache_usage)
+                num_generation_tokens += session_outputs.num_generation_tokens
+                preprocess_elapsed = max(
+                    preprocess_elapsed, session_outputs.preprocess_elapsed
+                )
+                forward_elapsed = max(forward_elapsed, session_outputs.forward_elapsed)
+                postprocess_elapsed = max(
+                    postprocess_elapsed, session_outputs.postprocess_elapsed
+                )
+                self._shadow_tksth_send_outputs(meta, session_outputs)
+
+        if not merged_outputs and not merged_request_ids:
+            return None
+
+        kv_cache_usage = (
+            sum(kv_cache_usages) / len(kv_cache_usages) if kv_cache_usages else 0.0
+        )
+        return ShadowEngineCoreOutputs(
+            outputs=merged_outputs,
+            request_ids=merged_request_ids,
+            kv_cache_usage=kv_cache_usage,
+            num_generation_tokens=num_generation_tokens,
+            preprocess_elapsed=preprocess_elapsed,
+            forward_elapsed=forward_elapsed,
+            postprocess_elapsed=postprocess_elapsed,
+        )
+
     def shutdown(self):
         for session in self._shadow_kvhts_sessions:
             session.cancel()
@@ -385,18 +481,18 @@ class ShadowEngineCore:
             session.join(timeout=2.0)
         self._shadow_kvhts_sessions.clear()
         self._completed_migration_ids.clear()
-        if self._execution_meta is not None:
-            self._execution_meta.tksth_sender.close()
-            self._execution_meta = None
+        for meta in self._execution_metas.values():
+            meta.tksth_sender.close()
+        self._execution_metas.clear()
 
     def shadow_migration_recv(self, migration_id: int, kvhts_ipc_path: str) -> None:
         """Create a KVHTS receiver session and start accepting on ``kvhts_ipc_path``."""
-        if any(
-            session.migration_id == migration_id
-            for session in self._shadow_kvhts_sessions
-        ) or (
-            self._execution_meta is not None
-            and self._execution_meta.migration_id == migration_id
+        if (
+            any(
+                session.migration_id == migration_id
+                for session in self._shadow_kvhts_sessions
+            )
+            or migration_id in self._execution_metas
         ):
             logger.warning(
                 "kvhts receiver: migration_id=%d already exists",
@@ -419,17 +515,15 @@ class ShadowEngineCore:
     ) -> list[str]:
         """Migrate requests to cold GPU."""
 
-        if (
-            self._execution_meta is None
-            or self._execution_meta.migration_id != migration_id
-        ):
+        meta = self._execution_metas.get(migration_id)
+        if meta is None:
             logger.warning(
                 "kvstc migration: migration_id=%d not found",
                 migration_id,
             )
             return []
 
-        kv_state = self._execution_meta.kv_state
+        kv_state = meta.kv_state
 
         logger.info(
             "Running kvstc migration: migration_id=%s kvstc_ipc_path=%s",
@@ -483,15 +577,15 @@ class ShadowEngineCore:
         )
 
         for request_id in request_ids:
-            self._execution_meta.tksth_sender.send(
+            meta.tksth_sender.send(
                 TksthFinish(
                     migration_id=migration_id,
                     request_id=request_id,
                     finish_reason="migrated",
                 )
             )
-        self._execution_meta.tksth_sender.close()
-        self._execution_meta = None
+        meta.tksth_sender.close()
+        del self._execution_metas[migration_id]
 
         return request_ids
 
@@ -503,8 +597,10 @@ class ShadowEngineCore:
     def _process_shadow_kvhts_results(self) -> None:
         still_active: list[ShadowKvhtsSession] = []
         for session in self._shadow_kvhts_sessions:
-            if not session.is_done or self._execution_meta is not None:
+            if not session.is_done:
                 still_active.append(session)
+                continue
+            if session.migration_id in self._execution_metas:
                 continue
             if session.handoff is None or session.layers is None:
                 logger.warning(
@@ -545,12 +641,17 @@ class ShadowEngineCore:
                     len(session.handoff.requests),
                 )
 
-                self._execution_meta = ExecutionMeta(
+                self._execution_metas[migration_id] = ExecutionMeta(
                     migration_id=migration_id,
                     kv_state=kv_state,
                     tksth_sender=tksth_sender,
                 )
                 self._completed_migration_ids.append(session.migration_id)
+                logger.info(
+                    "active migration sessions=%d threads_per_session=%d",
+                    len(self._execution_metas),
+                    self._threads_per_active_session(len(self._execution_metas)),
+                )
             except Exception:
                 logger.exception(
                     "failed to ingest kvhts session migration_id=%d",
@@ -558,12 +659,13 @@ class ShadowEngineCore:
                 )
         self._shadow_kvhts_sessions = still_active
 
-    def _shadow_tksth_send_outputs(self, outputs: ShadowEngineCoreOutputs) -> None:
+    def _shadow_tksth_send_outputs(
+        self, meta: ExecutionMeta, outputs: ShadowEngineCoreOutputs
+    ) -> None:
+        migration_id = meta.migration_id
+        kv_state = meta.kv_state
+        tksth_sender = meta.tksth_sender
         for output in outputs.outputs:
-            assert self._execution_meta is not None
-            migration_id = self._execution_meta.migration_id
-            kv_state = self._execution_meta.kv_state
-            tksth_sender = self._execution_meta.tksth_sender
             if output.error_message is not None:
                 tksth_sender.send(
                     TksthError(
@@ -591,8 +693,8 @@ class ShadowEngineCore:
             if output.finish_reason is not None or output.error_message is not None:
                 kv_state.remove_request(output.request_id)
                 if not kv_state.requests:
-                    self._execution_meta.tksth_sender.close()
-                    self._execution_meta = None
+                    meta.tksth_sender.close()
+                    del self._execution_metas[migration_id]
 
 
 class ShadowEngineCoreProc(ShadowEngineCore):
@@ -693,9 +795,8 @@ class ShadowEngineCoreProc(ShadowEngineCore):
                 engine_core.shutdown()
 
     def has_work(self) -> bool:
-        return bool(self._shadow_kvhts_sessions) or (
-            self._execution_meta is not None
-            and not self._execution_meta.waiting_for_migration
+        return bool(self._shadow_kvhts_sessions) or any(
+            not meta.waiting_for_migration for meta in self._execution_metas.values()
         )
 
     def run_busy_loop(self):
@@ -727,7 +828,6 @@ class ShadowEngineCoreProc(ShadowEngineCore):
         outputs = self.step()
         if outputs is not None:
             self.output_queue.put_nowait((0, outputs))
-            self._shadow_tksth_send_outputs(outputs)
 
     def _handle_client_request(
         self, request_type: ShadowEngineCoreRequestType, request: Any

@@ -11,6 +11,7 @@ Set an explicit CPU list (e.g. ``0-7``) to opt in to ``init_cpu_threads_env``.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import importlib
 import logging
@@ -178,3 +179,36 @@ def init_shadow_cpu_threads_env() -> None:
         return
     logger.info("Setting torch threads to %d (no CPU/NUMA bind)", n)
     torch.set_num_threads(n)
+
+
+@contextlib.contextmanager
+def set_default_torch_num_threads(num_threads: int | None = None):
+    """
+    Sets the default number of threads for PyTorch to the given value.
+
+    `None` means using the value of the environment variable `OMP_NUM_THREADS`
+    (or `1` if that is not available).
+    """
+    if num_threads is None:
+        num_threads = 1
+
+        try:
+            num_threads = int(os.environ["OMP_NUM_THREADS"])
+        except KeyError:
+            logger.debug_once(
+                "OMP_NUM_THREADS is not set; defaulting Torch threads to %d.",
+                num_threads,
+            )
+        except ValueError:
+            logger.warning_once(
+                "OMP_NUM_THREADS is invalid; defaulting Torch threads to %d.",
+                num_threads,
+            )
+
+    old_num_threads = torch.get_num_threads()
+    torch.set_num_threads(num_threads)
+
+    try:
+        yield
+    finally:
+        torch.set_num_threads(old_num_threads)

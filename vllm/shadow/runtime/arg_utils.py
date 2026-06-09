@@ -17,6 +17,7 @@ class ShadowEngineArgs:
     dtype: str = "auto"
     max_model_len: int | None = None
     block_size: int = 16
+    max_threads_per_session: int | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -51,6 +52,16 @@ class ShadowEngineArgs:
             type=int,
             default=16,
             help="KV block size; must match the hot pod ``--block-size``.",
+        )
+        parser.add_argument(
+            "--max-threads-per-session",
+            type=int,
+            default=None,
+            help=(
+                "Cap OpenMP/Torch threads for each concurrent migration session. "
+                "Active sessions share the engine thread pool (fair split capped "
+                "by this value). Unset means only fair-share division applies."
+            ),
         )
         return parser
 
