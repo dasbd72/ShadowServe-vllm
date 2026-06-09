@@ -4037,3 +4037,44 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+def test_shadow_migration_detach_requires_running():
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1)
+    scheduler.add_request(requests[0])
+    detached = scheduler.detach_requests_for_shadow_migration([requests[0].request_id])
+    assert detached == []
+
+
+def test_shadow_migration_promote_then_finish():
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1)
+    scheduler.add_request(requests[0])
+    scheduler.schedule()
+    req = requests[0]
+    assert req.status == RequestStatus.RUNNING
+    detached = scheduler.detach_requests_for_shadow_migration([req.request_id])
+    assert len(detached) == 1
+    assert req.status == RequestStatus.MIGRATING_TO_SHADOW
+
+    scheduler.promote_migrated_requests_to_shadow_running([req.request_id])
+    assert req.status == RequestStatus.RUNNING_ON_SHADOW
+    assert req.request_id in scheduler.requests
+
+    scheduler.finish_requests([req.request_id], RequestStatus.FINISHED_STOPPED)
+    assert req.request_id not in scheduler.requests
+
+
+def test_shadow_migration_finish_running_on_shadow_via_abort():
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=1)
+    scheduler.add_request(requests[0])
+    scheduler.schedule()
+    req = requests[0]
+    scheduler.detach_requests_for_shadow_migration([req.request_id])
+    scheduler.promote_migrated_requests_to_shadow_running([req.request_id])
+    assert req.status == RequestStatus.RUNNING_ON_SHADOW
+
+    scheduler.finish_requests([req.request_id], RequestStatus.FINISHED_ABORTED)
+    assert req.request_id not in scheduler.requests
